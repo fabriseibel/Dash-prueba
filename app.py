@@ -620,6 +620,74 @@ def _render_byma_card(item: dict) -> str:
     """
 
 
+def _render_heatmap(acciones: list[dict]) -> None:
+    """Treemap de acciones BYMA ordenado por volumen, coloreado por variación %."""
+    import plotly.graph_objects as go
+
+    # Filtrar filas con datos mínimos
+    rows = [
+        r for r in acciones
+        if r.get("ticker") and (r.get("v") or 0) > 0 and r.get("c")
+    ]
+    if not rows:
+        st.info("Sin datos de acciones todavía.")
+        return
+
+    tickers   = [r.get("ticker", "") for r in rows]
+    volumenes = [float(r.get("v") or 0) for r in rows]
+    pcts      = [float(r.get("pct_change") or 0) for r in rows]
+    precios   = [float(r.get("c") or 0) for r in rows]
+
+    max_abs = max((abs(p) for p in pcts), default=3)
+    max_abs = max(max_abs, 1)
+
+    labels = [
+        f"{t}<br>{'+' if p >= 0 else ''}{p:.2f}%"
+        for t, p in zip(tickers, pcts)
+    ]
+    custom = [
+        f"<b>{t}</b><br>Precio: ${pr:,.2f}<br>Var: {'+' if p >= 0 else ''}{p:.2f}%<br>Vol: {int(v):,}"
+        for t, pr, p, v in zip(tickers, precios, pcts, volumenes)
+    ]
+
+    fig = go.Figure(go.Treemap(
+        labels=labels,
+        parents=[""] * len(rows),
+        values=volumenes,
+        marker=dict(
+            colors=pcts,
+            colorscale=[
+                [0.0,  "#b91c1c"],   # rojo fuerte  (≤ -max)
+                [0.35, "#ef4444"],   # rojo
+                [0.5,  "#f3f4f6"],   # blanco neutro
+                [0.65, "#22c55e"],   # verde
+                [1.0,  "#15803d"],   # verde fuerte  (≥ +max)
+            ],
+            cmin=-max_abs,
+            cmid=0,
+            cmax=max_abs,
+            showscale=True,
+            colorbar=dict(
+                title="Var %",
+                tickformat="+.1f",
+                len=0.6,
+            ),
+        ),
+        customdata=custom,
+        hovertemplate="%{customdata}<extra></extra>",
+        textfont=dict(size=13, color="black"),
+    ))
+
+    fig.update_layout(
+        margin=dict(t=10, l=0, r=0, b=0),
+        height=620,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+
 def _render_byma_panel(title: str, emoji: str, items: list[dict],
                        cols_per_row: int = 4, top_n: int = 60,
                        buscar: str = "") -> None:
@@ -843,7 +911,7 @@ def main() -> None:
 
             (
                 tab_monedas, tab_pmon, tab_granos, tab_pgran,
-                tab_acc, tab_bon, tab_ced,
+                tab_acc, tab_bon, tab_ced, tab_heat,
             ) = st.tabs(
                 [
                     f"💵 Monedas ({len(monedas_puros)})",
@@ -853,6 +921,7 @@ def main() -> None:
                     f"🏢 Acciones ({len(acciones)})",
                     f"🏛️ Bonos ({len(bonos)})",
                     f"🍎 CEDEARs ({len(cedears)})",
+                    "🗺️ Mapa de Calor BYMA",
                 ]
             )
             with tab_monedas:
@@ -872,6 +941,8 @@ def main() -> None:
             with tab_ced:
                 _render_byma_panel("CEDEARs", "🍎", cedears,
                                    cols_per_row=cols_per_row, buscar=buscar)
+            with tab_heat:
+                _render_heatmap(acciones)
 
     render()
 
