@@ -675,9 +675,9 @@ def _render_heatmap(acciones: list[dict]) -> None:
     import plotly.graph_objects as go
 
     rows = {
-        str(r.get("ticker", "")).upper(): r
+        str(r.get("symbol", "") or r.get("ticker", "")).upper(): r
         for r in acciones
-        if r.get("ticker") and r.get("c")
+        if (r.get("symbol") or r.get("ticker")) and r.get("c")
     }
 
     ids, labels, parents, values, colors, custom = [], [], [], [], [], []
@@ -722,8 +722,7 @@ def _render_heatmap(acciones: list[dict]) -> None:
         )
 
     if not ids:
-        st.info(f"Sin datos de acciones todavía. Filas recibidas: {len(acciones)}. "
-                f"Ejemplo: {acciones[0] if acciones else 'vacío'}")
+        st.info("Sin datos de acciones todavía.")
         return
 
     max_abs = max((abs(c) for c in colors if c != 0.0), default=3)
