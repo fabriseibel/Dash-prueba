@@ -728,6 +728,19 @@ def _render_heatmap(acciones: list[dict]) -> None:
     max_abs = max((abs(c) for c in colors if c != 0.0), default=3)
     max_abs = max(max_abs, 1)
 
+    # Escala estilo Finviz: rojo puro → negro → verde puro
+    colorscale = [
+        [0.0,  "#9A0000"],
+        [0.2,  "#CC0000"],
+        [0.38, "#880000"],
+        [0.48, "#222222"],
+        [0.5,  "#1a1a1a"],
+        [0.52, "#003300"],
+        [0.62, "#007700"],
+        [0.8,  "#00AA00"],
+        [1.0,  "#00CC00"],
+    ]
+
     fig = go.Figure(go.Treemap(
         ids=ids,
         labels=labels,
@@ -736,33 +749,34 @@ def _render_heatmap(acciones: list[dict]) -> None:
         branchvalues="total",
         marker=dict(
             colors=colors,
-            colorscale=[
-                [0.0,  "#b91c1c"],
-                [0.35, "#ef4444"],
-                [0.5,  "#e5e7eb"],
-                [0.65, "#22c55e"],
-                [1.0,  "#15803d"],
-            ],
+            colorscale=colorscale,
             cmin=-max_abs,
             cmid=0,
             cmax=max_abs,
-            showscale=True,
-            colorbar=dict(title="Var %", tickformat="+.1f", len=0.5),
+            showscale=False,
+            line=dict(width=1, color="#000000"),
         ),
         customdata=custom,
         hovertemplate="%{customdata}<extra></extra>",
-        textfont=dict(size=12, color="white"),
-        pathbar=dict(visible=True),
+        textfont=dict(
+            size=13,
+            color="white",
+            family="Arial Black, Arial, sans-serif",
+        ),
+        textposition="middle center",
+        pathbar=dict(visible=False),
+        tiling=dict(packing="squarify", pad=2),
     ))
 
     fig.update_layout(
-        margin=dict(t=30, l=0, r=0, b=0),
-        height=650,
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(t=0, l=0, r=0, b=0),
+        height=680,
+        paper_bgcolor="#000000",
+        plot_bgcolor="#000000",
+        font=dict(color="white"),
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 
 def _render_byma_panel(title: str, emoji: str, items: list[dict],
