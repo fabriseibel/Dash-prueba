@@ -722,7 +722,8 @@ def _render_heatmap(acciones: list[dict]) -> None:
         )
 
     if not ids:
-        st.info("Sin datos de acciones todavía.")
+        st.info(f"Sin datos de acciones todavía. Filas recibidas: {len(acciones)}. "
+                f"Ejemplo: {acciones[0] if acciones else 'vacío'}")
         return
 
     max_abs = max((abs(c) for c in colors if c != 0.0), default=3)
