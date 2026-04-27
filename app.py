@@ -620,67 +620,144 @@ def _render_byma_card(item: dict) -> str:
     """
 
 
+# Capitalización de mercado en millones de ARS
+_CAP_MERC: dict[str, float] = {
+    "YPFD": 25270, "GGAL": 10380, "TECO2": 7290, "BMA": 7090, "TGSU2": 6810,
+    "PAMP": 6500, "BBAR": 4410, "CEPU": 3270, "TXAR": 3150, "ALUA": 2780,
+    "BYMA": 2380, "TGNO4": 1870, "LOMA": 1820, "IRSA": 1740, "TRAN": 1700,
+    "EDN": 1670, "BPAT": 1460, "CVH": 1320, "MOLA": 1200, "CRES": 1180,
+    "SUPV": 1170, "METR": 1090, "CAPX": 770.45, "VALO": 768.02, "CTIO": 756.28,
+    "CGPA2": 719.89, "A3": 716.30, "ECOG": 664.77, "GBAN": 659.22, "HARG": 634.56,
+    "PATA": 615, "MOLI": 542, "BHIP": 512.21, "GCLA": 408.42, "LEDE": 342.54,
+    "MIRG": 338.38, "COME": 334.81, "DGCU2": 331.86, "CECO2": 322.91,
+    "AUSO": 318.18, "INVJ": 317.09, "DGCE": 315.3, "HAVA": 277.16,
+    "RICH": 130.41, "GRIM": 122.95, "OEST": 120.48, "BOLT": 109.42,
+    "FERR": 98.11, "GAMI": 92.65, "SAMI": 81.98, "RIGO": 69.49,
+    "CADO": 67.88, "SEMI": 66.42, "AGRO": 54.84, "IEB": 47.6,
+    "INTR": 38.02, "FIPL": 33.6, "CELU": 27.86, "CARC": 25.65,
+    "GCDI": 14.51, "GARO": 11.59, "LONG": 9.82, "MORI": 8.34,
+    "ROSE": 6.94, "POLL": 1.7,
+}
+
+_SECTORES: dict[str, str] = {
+    "YPFD": "Energía", "PAMP": "Energía", "TGSU2": "Energía",
+    "TGNO4": "Energía", "CEPU": "Energía", "TRAN": "Energía",
+    "EDN": "Energía", "CAPX": "Energía", "DGCU2": "Energía",
+    "CECO2": "Energía", "HARG": "Energía", "CGPA2": "Energía",
+    "ROSE": "Energía",
+    "GGAL": "Financiero", "BMA": "Financiero", "BBAR": "Financiero",
+    "SUPV": "Financiero", "VALO": "Financiero", "BYMA": "Financiero",
+    "BHIP": "Financiero", "GCLA": "Financiero", "BPAT": "Financiero",
+    "GBAN": "Financiero", "INVJ": "Financiero", "IEB": "Financiero",
+    "INTR": "Financiero",
+    "TECO2": "Telecom", "CVH": "Telecom", "CTIO": "Telecom",
+    "ALUA": "Materiales", "LOMA": "Materiales", "TXAR": "Materiales",
+    "BOLT": "Materiales", "FERR": "Materiales", "GARO": "Materiales",
+    "CARC": "Materiales",
+    "IRSA": "Real Estate", "MOLA": "Real Estate", "CRES": "Real Estate",
+    "GCDI": "Real Estate", "LONG": "Real Estate",
+    "MOLI": "Consumo", "LEDE": "Consumo", "COME": "Consumo",
+    "RICH": "Consumo", "GRIM": "Consumo", "PATA": "Consumo",
+    "AGRO": "Consumo", "CADO": "Consumo", "POLL": "Consumo",
+    "SAMI": "Consumo", "RIGO": "Consumo", "MORI": "Consumo",
+    "AUSO": "Industrial", "MIRG": "Industrial", "FIPL": "Industrial",
+    "GAMI": "Industrial",
+    "METR": "Utilities", "ECOG": "Utilities", "OEST": "Utilities",
+    "DGCE": "Utilities", "A3": "Utilities",
+    "HAVA": "Salud", "CELU": "Salud",
+    "SEMI": "Tecnología",
+}
+
+
 def _render_heatmap(acciones: list[dict]) -> None:
-    """Treemap de acciones BYMA ordenado por volumen, coloreado por variación %."""
+    """Treemap de acciones BYMA agrupado por sector.
+    Tamaño = capitalización de mercado. Color = variación % del día."""
     import plotly.graph_objects as go
 
-    # Filtrar filas con datos mínimos
-    rows = [
-        r for r in acciones
-        if r.get("ticker") and (r.get("v") or 0) > 0 and r.get("c")
-    ]
-    if not rows:
+    rows = {
+        str(r.get("ticker", "")).upper(): r
+        for r in acciones
+        if r.get("ticker") and r.get("c")
+    }
+
+    ids, labels, parents, values, colors, custom = [], [], [], [], [], []
+
+    # Calcular cap total por sector para los nodos padre
+    sectores_cap: dict[str, float] = {}
+    for ticker, cap in _CAP_MERC.items():
+        if ticker not in rows:
+            continue
+        sector = _SECTORES.get(ticker, "Otros")
+        sectores_cap[sector] = sectores_cap.get(sector, 0) + cap
+
+    # Nodos padre (sectores)
+    for sector, total_cap in sectores_cap.items():
+        ids.append(sector)
+        labels.append(f"<b>{sector}</b>")
+        parents.append("")
+        values.append(total_cap)
+        colors.append(0.0)
+        custom.append(f"<b>{sector}</b>")
+
+    # Nodos hoja (acciones)
+    for ticker, cap in _CAP_MERC.items():
+        r = rows.get(ticker)
+        if r is None:
+            continue
+        sector = _SECTORES.get(ticker, "Otros")
+        precio = float(r.get("c") or 0)
+        pct    = float(r.get("pct_change") or 0)
+        vol    = int(r.get("v") or 0)
+        ids.append(ticker)
+        labels.append(f"{ticker}<br>{'+'if pct>=0 else ''}{pct:.2f}%")
+        parents.append(sector)
+        values.append(cap)
+        colors.append(pct)
+        custom.append(
+            f"<b>{ticker}</b><br>"
+            f"Precio: ${precio:,.2f}<br>"
+            f"Var: {'+'if pct>=0 else ''}{pct:.2f}%<br>"
+            f"Cap. Merc.: ${cap:,.0f}M<br>"
+            f"Vol: {vol:,}"
+        )
+
+    if not ids:
         st.info("Sin datos de acciones todavía.")
         return
 
-    tickers   = [r.get("ticker", "") for r in rows]
-    volumenes = [float(r.get("v") or 0) for r in rows]
-    pcts      = [float(r.get("pct_change") or 0) for r in rows]
-    precios   = [float(r.get("c") or 0) for r in rows]
-
-    max_abs = max((abs(p) for p in pcts), default=3)
+    max_abs = max((abs(c) for c in colors if c != 0.0), default=3)
     max_abs = max(max_abs, 1)
 
-    labels = [
-        f"{t}<br>{'+' if p >= 0 else ''}{p:.2f}%"
-        for t, p in zip(tickers, pcts)
-    ]
-    custom = [
-        f"<b>{t}</b><br>Precio: ${pr:,.2f}<br>Var: {'+' if p >= 0 else ''}{p:.2f}%<br>Vol: {int(v):,}"
-        for t, pr, p, v in zip(tickers, precios, pcts, volumenes)
-    ]
-
     fig = go.Figure(go.Treemap(
+        ids=ids,
         labels=labels,
-        parents=[""] * len(rows),
-        values=volumenes,
+        parents=parents,
+        values=values,
+        branchvalues="total",
         marker=dict(
-            colors=pcts,
+            colors=colors,
             colorscale=[
-                [0.0,  "#b91c1c"],   # rojo fuerte  (≤ -max)
-                [0.35, "#ef4444"],   # rojo
-                [0.5,  "#f3f4f6"],   # blanco neutro
-                [0.65, "#22c55e"],   # verde
-                [1.0,  "#15803d"],   # verde fuerte  (≥ +max)
+                [0.0,  "#b91c1c"],
+                [0.35, "#ef4444"],
+                [0.5,  "#e5e7eb"],
+                [0.65, "#22c55e"],
+                [1.0,  "#15803d"],
             ],
             cmin=-max_abs,
             cmid=0,
             cmax=max_abs,
             showscale=True,
-            colorbar=dict(
-                title="Var %",
-                tickformat="+.1f",
-                len=0.6,
-            ),
+            colorbar=dict(title="Var %", tickformat="+.1f", len=0.5),
         ),
         customdata=custom,
         hovertemplate="%{customdata}<extra></extra>",
-        textfont=dict(size=13, color="black"),
+        textfont=dict(size=12, color="white"),
+        pathbar=dict(visible=True),
     ))
 
     fig.update_layout(
-        margin=dict(t=10, l=0, r=0, b=0),
-        height=620,
+        margin=dict(t=30, l=0, r=0, b=0),
+        height=650,
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
     )
