@@ -143,7 +143,7 @@ class RofexManager:
                     user=veta_user,
                     password=veta_password,
                     account=veta_account,
-                    environment=pyRofex.Environment.CUSTOM,
+                    environment=pyRofex.Environment.REMARKET,
                     base_url=VETA_BASE_URL,
                     ws_url=VETA_WS_URL,
                 )
