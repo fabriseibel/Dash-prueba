@@ -139,19 +139,24 @@ class RofexManager:
         # Conectar Veta
         if veta_ok:
             try:
+                # Seteamos la URL de Veta via variable de entorno que pyRofex lee internamente
+                os.environ["PRIMARY_API_URL"] = VETA_BASE_URL
+                os.environ["PRIMARY_WS_URL"]  = VETA_WS_URL
                 pyRofex.initialize(
                     user=veta_user,
                     password=veta_password,
                     account=veta_account,
                     environment=pyRofex.Environment.REMARKET,
-                    base_url=VETA_BASE_URL,
-                    ws_url=VETA_WS_URL,
                 )
                 logger.info("Conectado a VETA OK")
                 self._discover_instruments("VETA", "DOLAR")
             except Exception as e:
                 logger.exception("Fallo Veta: %s", e)
                 self.error = f"Veta: {e}"
+            finally:
+                # Limpiar variables para que Remarkets use su propia URL
+                os.environ.pop("PRIMARY_API_URL", None)
+                os.environ.pop("PRIMARY_WS_URL", None)
 
         # Conectar Remarkets
         if remarkets_ok:
