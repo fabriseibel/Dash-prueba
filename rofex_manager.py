@@ -1,5 +1,9 @@
-"""Singleton manager para pyRofex: conexión, descubrimiento de instrumentos
-y suscripción WebSocket. Mantiene estado en memoria para que Streamlit lea."""
+"""Singleton manager para pyRofex con doble conexión:
+- VETA (broker real): DLR/ → datos en tiempo real
+- REMARKETS (demo): granos (SOJ, MAI, TRI, etc.) → settlement/cierre
+
+Mantiene estado en memoria para que Streamlit lea.
+"""
 from __future__ import annotations
 
 import logging
@@ -15,34 +19,26 @@ import requests
 import db
 
 
-# APIs externas (data912) para precios financieros que pyRofex no entrega:
-# dólares MEP/CCL y panel BYMA (acciones, bonos, CEDEARs).
+# ─── APIs externas (data912) ────────────────────────────────────────────────
 EXTERNAL_API_URLS = {
-    "MEP": "https://data912.com/live/mep",
-    "CCL": "https://data912.com/live/ccl",
+    "MEP":      "https://data912.com/live/mep",
+    "CCL":      "https://data912.com/live/ccl",
     "ACCIONES": "https://data912.com/live/arg_stocks",
-    "BONOS": "https://data912.com/live/arg_bonds",
-    "CEDEARS": "https://data912.com/live/arg_cedears",
+    "BONOS":    "https://data912.com/live/arg_bonds",
+    "CEDEARS":  "https://data912.com/live/arg_cedears",
 }
 EXTERNAL_REFRESH_SECS = 5
 
-logger = logging.getLogger("rofex_manager")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    h = logging.StreamHandler()
-    h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    logger.addHandler(h)
+# ─── Configuración Veta ──────────────────────────────────────────────────────
+VETA_BASE_URL = "https://api.veta.xoms.com.ar"
+VETA_WS_URL   = "wss://api.veta.xoms.com.ar"
 
+SNAPSHOT_SLEEP_VETA      = 0.1
+SNAPSHOT_SLEEP_REMARKETS = 0.1
 
+# ─── Clasificación ───────────────────────────────────────────────────────────
 DOLLAR_PREFIXES = ("DLR/",)
-GRAIN_PREFIXES = (
-    "SOJ.",
-    "MAI.",
-    "TRI.",
-    "SOR.",
-    "GIR.",
-    "CEB.",
-)
+GRAIN_PREFIXES  = ("SOJ.", "MAI.", "TRI.", "SOR.", "GIR.", "CEB.")
 
 
 def _classify(symbol: str) -> str | None:
@@ -55,27 +51,60 @@ def _classify(symbol: str) -> str | None:
     return None
 
 
+logger = logging.getLogger("rofex_manager")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(h)
+
+
+_MD_ENTRIES = [
+    pyRofex.MarketDataEntry.BIDS,
+    pyRofex.MarketDataEntry.OFFERS,
+    pyRofex.MarketDataEntry.LAST,
+    pyRofex.MarketDataEntry.OPENING_PRICE,
+    pyRofex.MarketDataEntry.CLOSING_PRICE,
+    pyRofex.MarketDataEntry.SETTLEMENT_PRICE,
+    pyRofex.MarketDataEntry.TRADE_VOLUME,
+    pyRofex.MarketDataEntry.OPEN_INTEREST,
+    pyRofex.MarketDataEntry.NOMINAL_VOLUME,
+]
+
+
 class RofexManager:
     _instance: "RofexManager | None" = None
     _lock = threading.Lock()
 
     def __init__(self) -> None:
-        self.initialized = False
+        self.initialized    = False
         self.error: str | None = None
-        self.symbols: list[str] = []
+
+        self.symbols_veta:      list[str] = []
+        self.symbols_remarkets: list[str] = []
+        self.symbols:           list[str] = []
+
         self.instrument_meta: dict[str, dict[str, Any]] = {}
-        self.market_data: dict[str, dict[str, Any]] = {}
-        self.last_update: datetime | None = None
-        self.snapshot_total = 0
-        self.snapshot_done = 0
-        self.snapshot_saved = 0
+        self.market_data:     dict[str, dict[str, Any]] = {}
+        self.last_update:     datetime | None = None
+
+        self.snapshot_total    = 0
+        self.snapshot_done     = 0
+        self.snapshot_saved    = 0
         self.snapshot_finished = False
-        self.ws_subscribed = False
-        # Datos de APIs externas (data912): MEP, CCL, acciones, bonos, CEDEARs
-        self.external_data: dict[str, list[dict[str, Any]]] = {}
+
+        self.ws_subscribed_veta      = False
+        self.ws_subscribed_remarkets = False
+
+        self.external_data:        dict[str, list[dict[str, Any]]] = {}
         self.external_last_update: datetime | None = None
-        self.external_errors: dict[str, str] = {}
+        self.external_errors:      dict[str, str]  = {}
+
         self._md_lock = threading.Lock()
+
+    @property
+    def ws_subscribed(self) -> bool:
+        return self.ws_subscribed_veta or self.ws_subscribed_remarkets
 
     @classmethod
     def get(cls) -> "RofexManager":
@@ -87,57 +116,223 @@ class RofexManager:
     def initialize(self) -> None:
         if self.initialized:
             return
-        user = (os.environ.get("PYROFEX_USER") or "").strip().strip('"').strip("'")
-        password = (os.environ.get("PYROFEX_PASSWORD") or "").strip().strip('"').strip("'")
-        account = (os.environ.get("PYROFEX_ACCOUNT") or "").strip().strip('"').strip("'")
-        if not user or not password or not account:
-            self.error = "Faltan credenciales PYROFEX_USER / PYROFEX_PASSWORD / PYROFEX_ACCOUNT"
+
+        veta_user     = _env("VETA_USER")
+        veta_password = _env("VETA_PASSWORD")
+        veta_account  = _env("VETA_ACCOUNT")
+
+        rm_user     = _env("PYROFEX_USER")
+        rm_password = _env("PYROFEX_PASSWORD")
+        rm_account  = _env("PYROFEX_ACCOUNT")
+
+        veta_ok      = bool(veta_user and veta_password and veta_account)
+        remarkets_ok = bool(rm_user and rm_password and rm_account)
+
+        if not veta_ok and not remarkets_ok:
+            self.error = (
+                "Faltan credenciales.\n"
+                "- VETA_USER / VETA_PASSWORD / VETA_ACCOUNT (dólar futuro)\n"
+                "- PYROFEX_USER / PYROFEX_PASSWORD / PYROFEX_ACCOUNT (granos)"
+            )
             return
 
-        masked_user = (user[:3] + "***" + user[-2:]) if len(user) > 5 else "***"
+        # Conectar Veta
+        if veta_ok:
+            try:
+                pyRofex.initialize(
+                    user=veta_user,
+                    password=veta_password,
+                    account=veta_account,
+                    environment=pyRofex.Environment.CUSTOM,
+                    base_url=VETA_BASE_URL,
+                    ws_url=VETA_WS_URL,
+                )
+                logger.info("Conectado a VETA OK")
+                self._discover_instruments("VETA", "DOLAR")
+            except Exception as e:
+                logger.exception("Fallo Veta: %s", e)
+                self.error = f"Veta: {e}"
+
+        # Conectar Remarkets
+        if remarkets_ok:
+            try:
+                pyRofex.initialize(
+                    user=rm_user,
+                    password=rm_password,
+                    account=rm_account,
+                    environment=pyRofex.Environment.REMARKET,
+                )
+                logger.info("Conectado a REMARKETS OK")
+                self._discover_instruments("REMARKETS", "GRANO")
+            except Exception as e:
+                logger.exception("Fallo Remarkets: %s", e)
+                self.error = (self.error + f" | Remarkets: {e}") if self.error else f"Remarkets: {e}"
+
+        self.symbols = sorted(set(self.symbols_veta + self.symbols_remarkets))
+        self.initialized = True
         logger.info(
-            "Intentando conectar a REMARKETS... user=%s (len=%d), password_len=%d, account=%s",
-            masked_user,
-            len(user),
-            len(password),
-            account,
+            "RofexManager listo — Veta DLR: %d, Remarkets granos: %d",
+            len(self.symbols_veta), len(self.symbols_remarkets),
         )
 
-        try:
-            pyRofex.initialize(
-                user=user,
-                password=password,
-                account=account,
-                environment=pyRofex.Environment.REMARKET,
-            )
-        except Exception as e:
-            self.error = (
-                f"Fallo al inicializar pyRofex en REMARKETS: {e}\n"
-                f"Verificá los Secrets PYROFEX_USER / PYROFEX_PASSWORD / PYROFEX_ACCOUNT en Replit. "
-                f"Detalle: usuario detectado='{masked_user}' (largo={len(user)}), "
-                f"largo password={len(password)}, cuenta='{account}'."
-            )
-            logger.exception("pyRofex.initialize falló")
-            return
+        if veta_ok and self.symbols_veta:
+            threading.Thread(
+                target=self._snapshot_and_ws,
+                args=("VETA", self.symbols_veta, SNAPSHOT_SLEEP_VETA),
+                daemon=True,
+            ).start()
 
-        logger.info("Conectado a REMARKETS OK")
+        if remarkets_ok and self.symbols_remarkets:
+            threading.Thread(
+                target=self._snapshot_and_ws,
+                args=("REMARKETS", self.symbols_remarkets, SNAPSHOT_SLEEP_REMARKETS),
+                daemon=True,
+            ).start()
 
-        try:
-            self._discover_instruments()
-        except Exception as e:
-            self.error = f"Fallo al descubrir instrumentos: {e}"
-            logger.exception("get_all_instruments falló")
-            return
-
-        self.initialized = True
-        logger.info("RofexManager listo (snapshot + WS arrancan en background)")
-
-        threading.Thread(target=self._snapshot_then_subscribe, daemon=True).start()
         threading.Thread(target=self._external_polling_loop, daemon=True).start()
 
+    def _discover_instruments(self, source: str, category_filter: str) -> None:
+        resp        = pyRofex.get_all_instruments()
+        instruments = resp.get("instruments", []) if isinstance(resp, dict) else []
+        for inst in instruments:
+            ident  = inst.get("instrumentId", {}) if isinstance(inst, dict) else {}
+            symbol = ident.get("symbol")
+            if not symbol:
+                continue
+            if _classify(symbol) != category_filter:
+                continue
+            self.instrument_meta[symbol] = {
+                "symbol":     symbol,
+                "category":   category_filter,
+                "underlying": symbol.split("/")[0],
+                "market":     ident.get("marketId"),
+                "cficode":    inst.get("cficode"),
+                "source":     source,
+            }
+            db.upsert_instrument({
+                "symbol":     symbol,
+                "category":   category_filter,
+                "underlying": symbol.split("/")[0],
+            })
+            if source == "VETA":
+                self.symbols_veta.append(symbol)
+            else:
+                self.symbols_remarkets.append(symbol)
+
+        self.symbols_veta      = sorted(set(self.symbols_veta))
+        self.symbols_remarkets = sorted(set(self.symbols_remarkets))
+        logger.info("Descubiertos %s (%s): %d", category_filter, source,
+                    len(self.symbols_veta if source == "VETA" else self.symbols_remarkets))
+
+    def _snapshot_and_ws(self, source: str, symbols: list[str], sleep_secs: float) -> None:
+        self._snapshot(source, symbols, sleep_secs)
+        self._connect_ws(source, symbols)
+
+    def _snapshot(self, source: str, symbols: list[str], sleep_secs: float) -> None:
+        self.snapshot_total += len(symbols)
+        logger.info("Snapshot %s: %d instrumentos", source, len(symbols))
+        for symbol in symbols:
+            try:
+                resp = pyRofex.get_market_data(ticker=symbol, entries=_MD_ENTRIES)
+                if not isinstance(resp, dict) or resp.get("status") != "OK":
+                    continue
+                row = self._parse_md(symbol, resp.get("marketData") or {})
+                with self._md_lock:
+                    self.market_data[symbol] = {**self.market_data.get(symbol, {}), **row}
+                    self.last_update = datetime.now(tz=timezone.utc)
+                db.insert_tick(self._tick_row(row))
+                self.snapshot_saved += 1
+            except Exception:
+                logger.exception("Snapshot %s error en %s", source, symbol)
+            finally:
+                self.snapshot_done += 1
+                time.sleep(sleep_secs)
+        self.snapshot_finished = (self.snapshot_done >= self.snapshot_total)
+        logger.info("Snapshot %s completo", source)
+
+    def _connect_ws(self, source: str, symbols: list[str]) -> None:
+        while True:
+            try:
+                pyRofex.init_websocket_connection(
+                    market_data_handler=self._on_market_data,
+                    error_handler=lambda m, s=source: self._on_ws_error(s, m),
+                    exception_handler=lambda e, s=source: self._on_ws_exc(s, e),
+                )
+                pyRofex.market_data_subscription(tickers=symbols, entries=_MD_ENTRIES)
+                if source == "VETA":
+                    self.ws_subscribed_veta = True
+                else:
+                    self.ws_subscribed_remarkets = True
+                logger.info("WS %s suscripto a %d instrumentos", source, len(symbols))
+                self._heartbeat_loop(source)
+            except Exception:
+                logger.exception("WS %s falló — reintentando en 30s", source)
+
+            if source == "VETA":
+                self.ws_subscribed_veta = False
+            else:
+                self.ws_subscribed_remarkets = False
+            time.sleep(30)
+
+    def _heartbeat_loop(self, source: str) -> None:
+        while True:
+            active = self.ws_subscribed_veta if source == "VETA" else self.ws_subscribed_remarkets
+            if not active:
+                break
+            try:
+                pyRofex.heartbeat()
+                logger.debug("Heartbeat %s OK", source)
+            except Exception as e:
+                logger.warning("Heartbeat %s falló: %s", source, e)
+                if source == "VETA":
+                    self.ws_subscribed_veta = False
+                else:
+                    self.ws_subscribed_remarkets = False
+                break
+            time.sleep(30)
+
+    def _on_market_data(self, message: dict[str, Any]) -> None:
+        try:
+            symbol = (message.get("instrumentId") or {}).get("symbol")
+            if not symbol:
+                return
+            row = self._parse_md(symbol, message.get("marketData") or {})
+            with self._md_lock:
+                merged = {**self.market_data.get(symbol, {})}
+                for k, v in row.items():
+                    if v is not None:
+                        merged[k] = v
+                prev = merged.get("settlement_price") or merged.get("closing_price")
+                ref  = merged.get("last_price") or merged.get("offer") or merged.get("bid")
+                if prev and ref:
+                    try:
+                        merged["change_pct"] = (ref - prev) / prev * 100
+                    except ZeroDivisionError:
+                        merged["change_pct"] = None
+                merged["prev_close"] = prev
+                merged["ts"]         = datetime.now(tz=timezone.utc).isoformat()
+                merged["symbol"]     = symbol
+                self.market_data[symbol] = merged
+                self.last_update = datetime.now(tz=timezone.utc)
+            db.insert_tick(self._tick_row(merged))
+        except Exception:
+            logger.exception("Error procesando market data")
+
+    def _on_ws_error(self, source: str, message: Any) -> None:
+        logger.error("WS %s error: %s", source, message)
+        if source == "VETA":
+            self.ws_subscribed_veta = False
+        else:
+            self.ws_subscribed_remarkets = False
+
+    def _on_ws_exc(self, source: str, exc: Exception) -> None:
+        logger.exception("WS %s exception: %s", source, exc)
+        if source == "VETA":
+            self.ws_subscribed_veta = False
+        else:
+            self.ws_subscribed_remarkets = False
+
     def _external_polling_loop(self) -> None:
-        """Loop infinito que cada N segundos consulta data912 (MEP, CCL,
-        acciones, bonos, CEDEARs) y guarda el resultado en `external_data`."""
         while True:
             for key, url in EXTERNAL_API_URLS.items():
                 try:
@@ -153,300 +348,103 @@ class RofexManager:
                 except Exception as e:
                     with self._md_lock:
                         self.external_errors[key] = str(e)
-                    logger.warning("Fallo consultando %s: %s", key, e)
+                    logger.warning("Fallo %s: %s", key, e)
             time.sleep(EXTERNAL_REFRESH_SECS)
 
     def get_external(self, key: str) -> list[dict[str, Any]]:
         with self._md_lock:
             return list(self.external_data.get(key, []))
 
-    def _snapshot_then_subscribe(self) -> None:
-        """Primero snapshot REST de todos los símbolos (escribe a Supabase),
-        después abre WebSocket. Si lo hacemos en paralelo el cliente REST se
-        traba con el WS."""
-        try:
-            self._snapshot_initial_prices()
-        except Exception:
-            logger.exception("Snapshot inicial falló")
-
-        try:
-            pyRofex.init_websocket_connection(
-                market_data_handler=self._on_market_data,
-                error_handler=self._on_error,
-                exception_handler=self._on_exception,
-            )
-            entries = [
-                pyRofex.MarketDataEntry.BIDS,
-                pyRofex.MarketDataEntry.OFFERS,
-                pyRofex.MarketDataEntry.LAST,
-                pyRofex.MarketDataEntry.OPENING_PRICE,
-                pyRofex.MarketDataEntry.CLOSING_PRICE,
-                pyRofex.MarketDataEntry.SETTLEMENT_PRICE,
-                pyRofex.MarketDataEntry.TRADE_VOLUME,
-                pyRofex.MarketDataEntry.OPEN_INTEREST,
-                pyRofex.MarketDataEntry.NOMINAL_VOLUME,
-            ]
-            pyRofex.market_data_subscription(tickers=self.symbols, entries=entries)
-            self.ws_subscribed = True
-            logger.info("WebSocket conectado y suscripto a %d instrumentos", len(self.symbols))
-        except Exception:
-            logger.exception("Fallo al abrir/suscribir WebSocket")
-
-    def _snapshot_initial_prices(self) -> None:
-        """Pide precios actuales por REST para todos los símbolos y los guarda
-        en Supabase + memoria. Útil cuando el mercado está cerrado y el WebSocket
-        no envía updates."""
-        self.snapshot_total = len(self.symbols)
-        self.snapshot_done = 0
-        self.snapshot_saved = 0
-        self.snapshot_finished = False
-        logger.info("Snapshot inicial: pidiendo market data REST de %d instrumentos", self.snapshot_total)
-        entries = [
-            pyRofex.MarketDataEntry.BIDS,
-            pyRofex.MarketDataEntry.OFFERS,
-            pyRofex.MarketDataEntry.LAST,
-            pyRofex.MarketDataEntry.OPENING_PRICE,
-            pyRofex.MarketDataEntry.CLOSING_PRICE,
-            pyRofex.MarketDataEntry.SETTLEMENT_PRICE,
-            pyRofex.MarketDataEntry.TRADE_VOLUME,
-            pyRofex.MarketDataEntry.OPEN_INTEREST,
-            pyRofex.MarketDataEntry.NOMINAL_VOLUME,
-        ]
-        for idx, symbol in enumerate(self.symbols, start=1):
+    def _parse_md(self, symbol: str, md: dict[str, Any]) -> dict[str, Any]:
+        last_price  = _price(md, "LA")
+        bid_price   = _price(md, "BI")
+        bid_size    = _size(md,  "BI")
+        offer_price = _price(md, "OF")
+        offer_size  = _size(md,  "OF")
+        opening     = _val(md,   "OP")
+        closing     = _val(md,   "CL")
+        settlement  = _val(md,   "SE")
+        trade_vol   = _val(md,   "TV")
+        open_int    = _val(md,   "OI")
+        nominal_vol = _val(md,   "NV")
+        prev_close  = settlement or closing
+        ref         = last_price or offer_price or bid_price
+        change_pct  = None
+        if prev_close and ref:
             try:
-                resp = pyRofex.get_market_data(ticker=symbol, entries=entries)
-                if not isinstance(resp, dict) or resp.get("status") != "OK":
-                    continue
-                md = resp.get("marketData", {}) or {}
-                last_price = self._extract_price(md, "LA")
-                bid_price = self._extract_price(md, "BI")
-                bid_size = self._extract_size(md, "BI")
-                offer_price = self._extract_price(md, "OF")
-                offer_size = self._extract_size(md, "OF")
-                opening = self._extract_value(md, "OP")
-                closing = self._extract_value(md, "CL")
-                settlement = self._extract_value(md, "SE")
-                trade_volume = self._extract_value(md, "TV")
-                open_interest = self._extract_value(md, "OI")
-                nominal_volume = self._extract_value(md, "NV")
-
-                prev_close = settlement or closing
-                ref = last_price or offer_price or bid_price
-                change_pct = None
-                if prev_close and ref:
-                    try:
-                        change_pct = (ref - prev_close) / prev_close * 100
-                    except ZeroDivisionError:
-                        change_pct = None
-
-                ts = datetime.now(tz=timezone.utc).isoformat()
-                merged = {
-                    "symbol": symbol,
-                    "ts": ts,
-                    "last_price": last_price,
-                    "bid": bid_price,
-                    "bid_size": bid_size,
-                    "offer": offer_price,
-                    "offer_size": offer_size,
-                    "opening_price": opening,
-                    "closing_price": closing,
-                    "settlement_price": settlement,
-                    "trade_volume": trade_volume,
-                    "open_interest": open_interest,
-                    "nominal_volume": nominal_volume,
-                    "prev_close": prev_close,
-                    "change_pct": change_pct,
-                }
-                with self._md_lock:
-                    self.market_data[symbol] = {**self.market_data.get(symbol, {}), **merged}
-                    self.last_update = datetime.now(tz=timezone.utc)
-
-                db.insert_tick(
-                    {
-                        "ts": ts,
-                        "symbol": symbol,
-                        "last_price": last_price,
-                        "bid": bid_price,
-                        "bid_size": bid_size,
-                        "offer": offer_price,
-                        "offer_size": offer_size,
-                        "volume": trade_volume,
-                        "open_interest": open_interest,
-                        "settlement_price": settlement,
-                        "prev_close": prev_close,
-                        "change_pct": change_pct,
-                    }
-                )
-                self.snapshot_saved += 1
-            except Exception:
-                logger.exception("Snapshot inicial: error con %s", symbol)
-            finally:
-                self.snapshot_done = idx
-                if idx % 25 == 0 or idx == self.snapshot_total:
-                    logger.info(
-                        "Snapshot progreso: %d/%d (guardados=%d)",
-                        idx, self.snapshot_total, self.snapshot_saved,
-                    )
-                time.sleep(0.05)
-        self.snapshot_finished = True
-        logger.info("Snapshot inicial completo: %d filas guardadas", self.snapshot_saved)
-
-    def _discover_instruments(self) -> None:
-        resp = pyRofex.get_all_instruments()
-        instruments = resp.get("instruments", []) if isinstance(resp, dict) else []
-        symbols: list[str] = []
-        for inst in instruments:
-            ident = inst.get("instrumentId", {}) if isinstance(inst, dict) else {}
-            symbol = ident.get("symbol")
-            if not symbol:
-                continue
-            category = _classify(symbol)
-            if not category:
-                continue
-            symbols.append(symbol)
-            self.instrument_meta[symbol] = {
-                "symbol": symbol,
-                "category": category,
-                "underlying": symbol.split("/")[0],
-                "market": ident.get("marketId"),
-                "cficode": inst.get("cficode"),
-            }
-            db.upsert_instrument(
-                {
-                    "symbol": symbol,
-                    "category": category,
-                    "underlying": symbol.split("/")[0],
-                }
-            )
-        symbols.sort()
-        self.symbols = symbols
-        logger.info(
-            "Instrumentos detectados: %d (dolares=%d, granos=%d)",
-            len(symbols),
-            sum(1 for s in symbols if self.instrument_meta[s]["category"] == "DOLAR"),
-            sum(1 for s in symbols if self.instrument_meta[s]["category"] == "GRANO"),
-        )
+                change_pct = (ref - prev_close) / prev_close * 100
+            except ZeroDivisionError:
+                pass
+        return {
+            "symbol":           symbol,
+            "ts":               datetime.now(tz=timezone.utc).isoformat(),
+            "last_price":       last_price,
+            "bid":              bid_price,
+            "bid_size":         bid_size,
+            "offer":            offer_price,
+            "offer_size":       offer_size,
+            "opening_price":    opening,
+            "closing_price":    closing,
+            "settlement_price": settlement,
+            "trade_volume":     trade_vol,
+            "open_interest":    open_int,
+            "nominal_volume":   nominal_vol,
+            "prev_close":       prev_close,
+            "change_pct":       change_pct,
+        }
 
     @staticmethod
-    def _extract_price(entries: dict[str, Any], key: str) -> float | None:
-        v = entries.get(key)
-        if isinstance(v, dict):
-            return v.get("price")
-        if isinstance(v, list) and v:
-            first = v[0]
-            if isinstance(first, dict):
-                return first.get("price")
-        if isinstance(v, (int, float)):
-            return float(v)
-        return None
-
-    @staticmethod
-    def _extract_size(entries: dict[str, Any], key: str) -> float | None:
-        v = entries.get(key)
-        if isinstance(v, dict):
-            return v.get("size")
-        if isinstance(v, list) and v:
-            first = v[0]
-            if isinstance(first, dict):
-                return first.get("size")
-        return None
-
-    @staticmethod
-    def _extract_value(entries: dict[str, Any], key: str) -> float | None:
-        v = entries.get(key)
-        if isinstance(v, (int, float)):
-            return float(v)
-        if isinstance(v, dict):
-            return v.get("price") or v.get("size") or v.get("value")
-        return None
-
-    def _on_market_data(self, message: dict[str, Any]) -> None:
-        try:
-            instrument_id = message.get("instrumentId", {})
-            symbol = instrument_id.get("symbol")
-            if not symbol:
-                return
-            md = message.get("marketData", {}) or {}
-
-            last_price = self._extract_price(md, "LA")
-            bid_price = self._extract_price(md, "BI")
-            bid_size = self._extract_size(md, "BI")
-            offer_price = self._extract_price(md, "OF")
-            offer_size = self._extract_size(md, "OF")
-            opening = self._extract_value(md, "OP")
-            closing = self._extract_value(md, "CL")
-            settlement = self._extract_value(md, "SE")
-            trade_volume = self._extract_value(md, "TV")
-            open_interest = self._extract_value(md, "OI")
-            nominal_volume = self._extract_value(md, "NV")
-
-            with self._md_lock:
-                cur = self.market_data.get(symbol, {})
-                merged = {**cur}
-                if last_price is not None:
-                    merged["last_price"] = last_price
-                if bid_price is not None:
-                    merged["bid"] = bid_price
-                    merged["bid_size"] = bid_size
-                if offer_price is not None:
-                    merged["offer"] = offer_price
-                    merged["offer_size"] = offer_size
-                if opening is not None:
-                    merged["opening_price"] = opening
-                if closing is not None:
-                    merged["closing_price"] = closing
-                if settlement is not None:
-                    merged["settlement_price"] = settlement
-                if trade_volume is not None:
-                    merged["trade_volume"] = trade_volume
-                if open_interest is not None:
-                    merged["open_interest"] = open_interest
-                if nominal_volume is not None:
-                    merged["nominal_volume"] = nominal_volume
-
-                prev_close = merged.get("settlement_price") or merged.get("closing_price")
-                ref = merged.get("last_price") or merged.get("offer") or merged.get("bid")
-                if prev_close and ref:
-                    try:
-                        merged["change_pct"] = (ref - prev_close) / prev_close * 100
-                    except ZeroDivisionError:
-                        merged["change_pct"] = None
-                merged["prev_close"] = prev_close
-                merged["ts"] = datetime.now(tz=timezone.utc).isoformat()
-                merged["symbol"] = symbol
-                self.market_data[symbol] = merged
-                self.last_update = datetime.now(tz=timezone.utc)
-
-            db.insert_tick(
-                {
-                    "ts": merged["ts"],
-                    "symbol": symbol,
-                    "last_price": merged.get("last_price"),
-                    "bid": merged.get("bid"),
-                    "bid_size": merged.get("bid_size"),
-                    "offer": merged.get("offer"),
-                    "offer_size": merged.get("offer_size"),
-                    "volume": merged.get("trade_volume"),
-                    "open_interest": merged.get("open_interest"),
-                    "settlement_price": merged.get("settlement_price"),
-                    "prev_close": merged.get("prev_close"),
-                    "change_pct": merged.get("change_pct"),
-                }
-            )
-        except Exception:
-            logger.exception("Error procesando market data")
-
-    def _on_error(self, message: Any) -> None:
-        logger.error("WebSocket error: %s", message)
-
-    def _on_exception(self, exc: Exception) -> None:
-        logger.exception("WebSocket exception: %s", exc)
+    def _tick_row(r: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "ts":               r.get("ts"),
+            "symbol":           r.get("symbol"),
+            "last_price":       r.get("last_price"),
+            "bid":              r.get("bid"),
+            "bid_size":         r.get("bid_size"),
+            "offer":            r.get("offer"),
+            "offer_size":       r.get("offer_size"),
+            "volume":           r.get("trade_volume"),
+            "open_interest":    r.get("open_interest"),
+            "settlement_price": r.get("settlement_price"),
+            "prev_close":       r.get("prev_close"),
+            "change_pct":       r.get("change_pct"),
+        }
 
     def snapshot(self) -> list[dict[str, Any]]:
         with self._md_lock:
-            rows = []
-            for symbol in self.symbols:
-                meta = self.instrument_meta.get(symbol, {})
-                data = self.market_data.get(symbol, {})
-                rows.append({**meta, **data})
-            return rows
+            return [
+                {**self.instrument_meta.get(s, {}), **self.market_data.get(s, {})}
+                for s in self.symbols
+            ]
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _env(key: str) -> str:
+    return (os.environ.get(key) or "").strip().strip('"').strip("'")
+
+
+def _price(entries: dict, key: str) -> float | None:
+    v = entries.get(key)
+    if isinstance(v, dict):              return v.get("price")
+    if isinstance(v, list) and v:
+        f = v[0]
+        if isinstance(f, dict):          return f.get("price")
+    if isinstance(v, (int, float)):      return float(v)
+    return None
+
+
+def _size(entries: dict, key: str) -> float | None:
+    v = entries.get(key)
+    if isinstance(v, dict):              return v.get("size")
+    if isinstance(v, list) and v:
+        f = v[0]
+        if isinstance(f, dict):          return f.get("size")
+    return None
+
+
+def _val(entries: dict, key: str) -> float | None:
+    v = entries.get(key)
+    if isinstance(v, (int, float)):      return float(v)
+    if isinstance(v, dict):
+        return v.get("price") or v.get("size") or v.get("value")
+    return None
