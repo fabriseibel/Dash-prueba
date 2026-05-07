@@ -159,7 +159,7 @@ class RofexManager:
                     password=veta_password,
                     account=veta_account,
                     environment=pyRofex.Environment.LIVE,
-                    api_url=VETA_BASE_URL,
+                    url=VETA_BASE_URL,
                     websocket_url=VETA_WS_URL,
                 )
                 logger.info("Conectado a VETA (LIVE) OK")
