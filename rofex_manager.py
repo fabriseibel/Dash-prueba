@@ -91,7 +91,8 @@ class RofexManager:
         self.snapshot_total    = 0
         self.snapshot_done     = 0
         self.snapshot_saved    = 0
-        self.snapshot_finished = False
+        self.snapshot_finished_veta      = False
+        self.snapshot_finished_remarkets = False
 
         self.ws_subscribed_veta      = False
         self.ws_subscribed_remarkets = False
@@ -109,6 +110,13 @@ class RofexManager:
     @property
     def ws_subscribed(self) -> bool:
         return self.ws_subscribed_veta or self.ws_subscribed_remarkets
+
+    @property
+    def snapshot_finished(self) -> bool:
+        """True si ambos snapshots (los que aplican) terminaron."""
+        veta_done = self.snapshot_finished_veta or not self.symbols_veta
+        rm_done   = self.snapshot_finished_remarkets or not self.symbols_remarkets
+        return veta_done and rm_done
 
     @classmethod
     def get(cls) -> "RofexManager":
@@ -259,7 +267,7 @@ class RofexManager:
                 self.snapshot_done += 1
                 time.sleep(SNAPSHOT_SLEEP)
 
-        self.snapshot_finished = True  # Siempre termina aunque algunos fallen
+        self.snapshot_finished_veta = True
         logger.info("Snapshot Veta completo")
         self._veta_connect_ws()
 
@@ -372,7 +380,7 @@ class RofexManager:
             finally:
                 self.snapshot_done += 1
                 time.sleep(SNAPSHOT_SLEEP)
-        self.snapshot_finished = True  # Siempre termina aunque algunos fallen
+        self.snapshot_finished_remarkets = True
         logger.info("Snapshot Remarkets completo")
         self._remarkets_connect_ws()
 
