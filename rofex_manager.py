@@ -102,8 +102,10 @@ class RofexManager:
         self.external_errors:      dict[str, str]  = {}
 
         # Token Veta (dura 24hs)
-        self._veta_token: str | None = None
-        self._veta_account: str = ""
+        self._veta_token:    str | None = None
+        self._veta_account:  str = ""
+        self._veta_user:     str = ""
+        self._veta_password: str = ""
 
         self._md_lock = threading.Lock()
 
@@ -147,7 +149,9 @@ class RofexManager:
 
         # ── Conectar Veta directamente (REST) ─────────────────────────────────
         if veta_ok:
-            self._veta_account = veta_account
+            self._veta_account  = veta_account
+            self._veta_user     = veta_user
+            self._veta_password = veta_password
             token = self._veta_get_token(veta_user, veta_password)
             if token:
                 self._veta_token = token
@@ -240,10 +244,24 @@ class RofexManager:
 
     # ── Veta: snapshot REST ───────────────────────────────────────────────────
     def _veta_snapshot_and_ws(self) -> None:
+        # Renueva el token cada 23 horas en background
+        threading.Thread(target=self._veta_token_refresh_loop, daemon=True).start()
         # Arranca el WebSocket en paralelo mientras hace el snapshot
         threading.Thread(target=self._veta_connect_ws, daemon=True).start()
-        
+
         self.snapshot_total += len(self.symbols_veta)
+
+    def _veta_token_refresh_loop(self) -> None:
+        """Renueva el token de Veta cada 23 horas (el token dura 24hs)."""
+        while True:
+            time.sleep(23 * 3600)
+            logger.info("Renovando token Veta...")
+            new_token = self._veta_get_token(self._veta_user, self._veta_password)
+            if new_token:
+                self._veta_token = new_token
+                logger.info("Token Veta renovado OK")
+            else:
+                logger.error("Falló renovación de token Veta")
         logger.info("Snapshot Veta: %d instrumentos", len(self.symbols_veta))
 
         entries_param = ",".join(_MD_ENTRY_CODES)
