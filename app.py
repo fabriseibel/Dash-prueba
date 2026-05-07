@@ -860,8 +860,20 @@ def main() -> None:
         st.header("Estado")
         if mgr.error:
             st.error(mgr.error)
-        elif mgr.initialized:
-            st.success("Conectado a REMARKETS")
+        if mgr.initialized:
+            if mgr.ws_subscribed_veta:
+                st.success(f"✓ Veta (DLR): {len(mgr.symbols_veta)} contratos")
+            elif mgr.symbols_veta:
+                st.warning(f"⏳ Veta (DLR): conectando... {len(mgr.symbols_veta)} contratos")
+            else:
+                st.error("✗ Veta (DLR): sin conexión")
+
+            if mgr.ws_subscribed_remarkets:
+                st.success(f"✓ Remarkets (Granos): {len(mgr.symbols_remarkets)} contratos")
+            elif mgr.symbols_remarkets:
+                st.warning(f"⏳ Remarkets (Granos): conectando... {len(mgr.symbols_remarkets)} contratos")
+            else:
+                st.error("✗ Remarkets (Granos): sin conexión")
         else:
             st.warning("Inicializando...")
 
