@@ -242,7 +242,7 @@ class RofexManager:
                     f"{VETA_API}/rest/marketdata/get",
                     headers={"X-Auth-Token": self._veta_token},
                     params={"ticker": symbol, "entries": entries_param},
-                    timeout=8,
+                    timeout=3,
                 )
                 if resp.status_code == 200:
                     data = resp.json()
@@ -259,7 +259,7 @@ class RofexManager:
                 self.snapshot_done += 1
                 time.sleep(SNAPSHOT_SLEEP)
 
-        self.snapshot_finished = (self.snapshot_done >= self.snapshot_total)
+        self.snapshot_finished = True  # Siempre termina aunque algunos fallen
         logger.info("Snapshot Veta completo")
         self._veta_connect_ws()
 
@@ -372,7 +372,7 @@ class RofexManager:
             finally:
                 self.snapshot_done += 1
                 time.sleep(SNAPSHOT_SLEEP)
-        self.snapshot_finished = (self.snapshot_done >= self.snapshot_total)
+        self.snapshot_finished = True  # Siempre termina aunque algunos fallen
         logger.info("Snapshot Remarkets completo")
         self._remarkets_connect_ws()
 
