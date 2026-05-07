@@ -240,6 +240,9 @@ class RofexManager:
 
     # ── Veta: snapshot REST ───────────────────────────────────────────────────
     def _veta_snapshot_and_ws(self) -> None:
+        # Arranca el WebSocket en paralelo mientras hace el snapshot
+        threading.Thread(target=self._veta_connect_ws, daemon=True).start()
+        
         self.snapshot_total += len(self.symbols_veta)
         logger.info("Snapshot Veta: %d instrumentos", len(self.symbols_veta))
 
@@ -269,7 +272,6 @@ class RofexManager:
 
         self.snapshot_finished_veta = True
         logger.info("Snapshot Veta completo")
-        self._veta_connect_ws()
 
     # ── Veta: WebSocket ───────────────────────────────────────────────────────
     def _veta_connect_ws(self) -> None:
@@ -362,6 +364,9 @@ class RofexManager:
 
     # ── Remarkets: snapshot + WS ──────────────────────────────────────────────
     def _remarkets_snapshot_and_ws(self) -> None:
+        # Arranca el WebSocket en paralelo mientras hace el snapshot
+        threading.Thread(target=self._remarkets_connect_ws, daemon=True).start()
+
         self.snapshot_total += len(self.symbols_remarkets)
         logger.info("Snapshot Remarkets: %d instrumentos", len(self.symbols_remarkets))
         for symbol in self.symbols_remarkets:
@@ -382,7 +387,6 @@ class RofexManager:
                 time.sleep(SNAPSHOT_SLEEP)
         self.snapshot_finished_remarkets = True
         logger.info("Snapshot Remarkets completo")
-        self._remarkets_connect_ws()
 
     def _remarkets_connect_ws(self) -> None:
         while True:
