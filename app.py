@@ -899,7 +899,7 @@ def main() -> None:
         if mgr.ws_subscribed:
             st.caption("WebSocket suscripto ✓")
         else:
-            st.caption("WebSocket: en espera (arranca al terminar el snapshot)")
+            st.caption("WebSocket: conectando...")
 
         if mgr.last_update:
             local = mgr.last_update.astimezone(BA_TZ)
