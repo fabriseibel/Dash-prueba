@@ -147,18 +147,22 @@ class RofexManager:
             self.error = "Faltan credenciales VETA o PYROFEX"
             return
 
-        # ── Conectar Veta directamente (REST) ─────────────────────────────────
+        # ── Conectar Veta via pyRofex (LIVE environment) ──────────────────────
         if veta_ok:
-            self._veta_account  = veta_account
-            self._veta_user     = veta_user
-            self._veta_password = veta_password
-            token = self._veta_get_token(veta_user, veta_password)
-            if token:
-                self._veta_token = token
-                logger.info("Token Veta OK")
-                self._veta_discover_instruments()
-            else:
-                self.error = "Veta: no se pudo obtener token"
+            try:
+                pyRofex.initialize(
+                    user=veta_user,
+                    password=veta_password,
+                    account=veta_account,
+                    environment=pyRofex.Environment.LIVE,
+                    api_url=VETA_BASE_URL,
+                    websocket_url=VETA_WS_URL,
+                )
+                logger.info("Conectado a VETA (LIVE) OK")
+                self._veta_discover_instruments_pyrofex()
+            except Exception as e:
+                logger.exception("Fallo Veta LIVE: %s", e)
+                self.error = f"Veta: {e}"
 
         # ── Conectar Remarkets via pyRofex (granos) ───────────────────────────
         if remarkets_ok:
@@ -213,8 +217,79 @@ class RofexManager:
             logger.exception("Veta getToken falló: %s", e)
             return None
 
-    # ── Veta: descubrimiento de instrumentos ──────────────────────────────────
-    def _veta_discover_instruments(self) -> None:
+    # ── Veta: descubrimiento via pyRofex ─────────────────────────────────────
+    def _veta_discover_instruments_pyrofex(self) -> None:
+        resp        = pyRofex.get_all_instruments()
+        instruments = resp.get("instruments", []) if isinstance(resp, dict) else []
+        for inst in instruments:
+            ident  = inst.get("instrumentId", {}) if isinstance(inst, dict) else {}
+            symbol = ident.get("symbol")
+            if not symbol or _classify(symbol) != "DOLAR":
+                continue
+            self.instrument_meta[symbol] = {
+                "symbol":     symbol,
+                "category":   "DOLAR",
+                "underlying": symbol.split("/")[0],
+                "source":     "VETA",
+            }
+            db.upsert_instrument({"symbol": symbol, "category": "DOLAR", "underlying": "DLR"})
+            self.symbols_veta.append(symbol)
+        self.symbols_veta = sorted(set(self.symbols_veta))
+        logger.info("Veta DLR descubiertos: %d", len(self.symbols_veta))
+
+    # ── Veta: snapshot REST via pyRofex ──────────────────────────────────────
+    def _veta_snapshot_and_ws(self) -> None:
+        threading.Thread(target=self._veta_token_refresh_loop, daemon=True).start()
+        threading.Thread(target=self._veta_connect_ws_pyrofex, daemon=True).start()
+
+        self.snapshot_total += len(self.symbols_veta)
+        logger.info("Snapshot Veta: %d instrumentos", len(self.symbols_veta))
+        for symbol in self.symbols_veta:
+            try:
+                resp = pyRofex.get_market_data(ticker=symbol, entries=_MD_ENTRIES)
+                if not isinstance(resp, dict) or resp.get("status") != "OK":
+                    continue
+                row = self._parse_md(symbol, resp.get("marketData") or {})
+                with self._md_lock:
+                    self.market_data[symbol] = {**self.market_data.get(symbol, {}), **row}
+                    self.last_update = datetime.now(tz=timezone.utc)
+                db.insert_tick(self._tick_row(row))
+                self.snapshot_saved += 1
+            except Exception:
+                logger.exception("Snapshot Veta error en %s", symbol)
+            finally:
+                self.snapshot_done += 1
+                time.sleep(SNAPSHOT_SLEEP_VETA)
+        self.snapshot_finished_veta = True
+        logger.info("Snapshot Veta completo")
+
+    def _veta_connect_ws_pyrofex(self) -> None:
+        """WebSocket de Veta usando pyRofex (igual que Remarkets)."""
+        while True:
+            try:
+                pyRofex.init_websocket_connection(
+                    market_data_handler=self._on_market_data,
+                    error_handler=lambda m: self._on_ws_error("VETA", m),
+                    exception_handler=lambda e: self._on_ws_exc("VETA", e),
+                )
+                pyRofex.market_data_subscription(
+                    tickers=self.symbols_veta,
+                    entries=_MD_ENTRIES,
+                )
+                self.ws_subscribed_veta = True
+                logger.info("Veta WS suscripto a %d DLR", len(self.symbols_veta))
+                while self.ws_subscribed_veta:
+                    try:
+                        pyRofex.heartbeat()
+                    except Exception as e:
+                        logger.warning("Veta heartbeat falló: %s", e)
+                        self.ws_subscribed_veta = False
+                        break
+                    time.sleep(30)
+            except Exception:
+                logger.exception("Veta WS falló — reintentando en 30s")
+            self.ws_subscribed_veta = False
+            time.sleep(30)
         try:
             resp = requests.get(
                 f"{VETA_API}/rest/instruments/all",
