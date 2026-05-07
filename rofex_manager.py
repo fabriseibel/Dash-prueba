@@ -183,15 +183,20 @@ class RofexManager:
         try:
             resp = requests.post(
                 f"{VETA_API}/auth/getToken",
-                json={"username": user, "password": password},
+                headers={
+                    "X-Username": user,
+                    "X-Password": password,
+                },
                 timeout=10,
             )
             resp.raise_for_status()
-            data = resp.json()
-            token = data.get("token") or data.get("access_token") or data.get("X-Auth-Token")
-            if not token and isinstance(data, str):
-                token = data
-            return token
+            # El token viene en el header X-Auth-Token, no en el body
+            token = resp.headers.get("X-Auth-Token")
+            if token:
+                logger.info("Token Veta obtenido OK")
+                return token
+            logger.error("Veta: X-Auth-Token no encontrado en headers. Headers: %s", dict(resp.headers))
+            return None
         except Exception as e:
             logger.exception("Veta getToken falló: %s", e)
             return None
@@ -200,7 +205,7 @@ class RofexManager:
     def _veta_discover_instruments(self) -> None:
         try:
             resp = requests.get(
-                f"{VETA_API}/instruments/all",
+                f"{VETA_API}/rest/instruments/all",
                 headers={"X-Auth-Token": self._veta_token},
                 timeout=15,
             )
@@ -234,7 +239,7 @@ class RofexManager:
         for symbol in self.symbols_veta:
             try:
                 resp = requests.get(
-                    f"{VETA_API}/marketdata/get",
+                    f"{VETA_API}/rest/marketdata/get",
                     headers={"X-Auth-Token": self._veta_token},
                     params={"ticker": symbol, "entries": entries_param},
                     timeout=8,
