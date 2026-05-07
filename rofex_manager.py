@@ -31,10 +31,14 @@ EXTERNAL_API_URLS = {
 EXTERNAL_REFRESH_SECS = 5
 
 # ─── Veta ─────────────────────────────────────────────────────────────────────
-VETA_API  = "https://api.veta.xoms.com.ar"
-VETA_WS   = "wss://api.veta.xoms.com.ar/websocket/auth"
+VETA_API      = "https://api.veta.xoms.com.ar"
+VETA_BASE_URL = "https://api.veta.xoms.com.ar"
+VETA_WS       = "wss://api.veta.xoms.com.ar/websocket/auth"
+VETA_WS_URL   = "wss://api.veta.xoms.com.ar"
 
-SNAPSHOT_SLEEP = 0.1
+SNAPSHOT_SLEEP      = 0.1
+SNAPSHOT_SLEEP_VETA = 0.1
+SNAPSHOT_SLEEP_REMARKETS = 0.1
 
 # ─── Clasificación ────────────────────────────────────────────────────────────
 DOLLAR_PREFIXES = ("DLR/",)
