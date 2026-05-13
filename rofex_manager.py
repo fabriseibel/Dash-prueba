@@ -1,12 +1,9 @@
 """Singleton manager con doble conexión:
-- VETA (REST + WebSocket directo): DLR/ → datos en tiempo real sin pyRofex
-- REMARKETS (pyRofex): granos (SOJ, MAI, TRI, etc.)
-
-Mantiene estado en memoria para que Streamlit lea.
+- VETA (REST polling cada 2s): DLR/ → datos en tiempo real
+- REMARKETS (pyRofex WS): granos (SOJ, MAI, TRI, etc.)
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
 import threading
@@ -19,8 +16,6 @@ import requests
 
 import db
 
-
-# ─── APIs externas (data912) ─────────────────────────────────────────────────
 EXTERNAL_API_URLS = {
     "MEP":      "https://data912.com/live/mep",
     "CCL":      "https://data912.com/live/ccl",
@@ -30,28 +25,9 @@ EXTERNAL_API_URLS = {
 }
 EXTERNAL_REFRESH_SECS = 5
 
-# ─── Veta ─────────────────────────────────────────────────────────────────────
-VETA_API      = "https://api.veta.xoms.com.ar"
-VETA_BASE_URL = "https://api.veta.xoms.com.ar"
-VETA_WS       = "wss://api.veta.xoms.com.ar/websocket/auth"
-VETA_WS_URL   = "wss://api.veta.xoms.com.ar"
-
-SNAPSHOT_SLEEP      = 0.1
-SNAPSHOT_SLEEP_VETA = 0.1
-SNAPSHOT_SLEEP_REMARKETS = 0.1
-
-# ─── Clasificación ────────────────────────────────────────────────────────────
-DOLLAR_PREFIXES = ("DLR/",)
-GRAIN_PREFIXES  = ("SOJ.", "MAI.", "TRI.", "SOR.", "GIR.", "CEB.")
-
-
-def _classify(symbol: str) -> str | None:
-    s = symbol.upper()
-    if s.startswith(DOLLAR_PREFIXES):  return "DOLAR"
-    for p in GRAIN_PREFIXES:
-        if s.startswith(p):            return "GRANO"
-    return None
-
+VETA_API    = "https://api.veta.xoms.com.ar"
+VETA_MARKET = "ROFX"
+VETA_POLL_SECS = 2  # Polling cada 2 segundos
 
 logger = logging.getLogger("rofex_manager")
 logger.setLevel(logging.INFO)
@@ -60,8 +36,19 @@ if not logger.handlers:
     h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     logger.addHandler(h)
 
+DOLLAR_PREFIXES = ("DLR/",)
+GRAIN_PREFIXES  = ("SOJ.", "MAI.", "TRI.", "SOR.", "GIR.", "CEB.")
 
-_MD_ENTRIES = [
+
+def _classify(symbol: str) -> str | None:
+    s = symbol.upper()
+    if s.startswith(DOLLAR_PREFIXES): return "DOLAR"
+    for p in GRAIN_PREFIXES:
+        if s.startswith(p): return "GRANO"
+    return None
+
+
+_MD_ENTRIES_PYROFEX = [
     pyRofex.MarketDataEntry.BIDS,
     pyRofex.MarketDataEntry.OFFERS,
     pyRofex.MarketDataEntry.LAST,
@@ -72,8 +59,7 @@ _MD_ENTRIES = [
     pyRofex.MarketDataEntry.OPEN_INTEREST,
     pyRofex.MarketDataEntry.NOMINAL_VOLUME,
 ]
-
-_MD_ENTRY_CODES = ["BI", "OF", "LA", "OP", "CL", "SE", "TV", "OI", "NV"]
+_MD_ENTRIES_VETA = "LA,BI,OF,OP,CL,SE,TV,OI,NV"
 
 
 class RofexManager:
@@ -92,25 +78,22 @@ class RofexManager:
         self.market_data:     dict[str, dict[str, Any]] = {}
         self.last_update:     datetime | None = None
 
-        self.snapshot_total    = 0
-        self.snapshot_done     = 0
-        self.snapshot_saved    = 0
+        self.snapshot_total              = 0
+        self.snapshot_done               = 0
+        self.snapshot_saved              = 0
         self.snapshot_finished_veta      = False
         self.snapshot_finished_remarkets = False
 
         self.ws_subscribed_veta      = False
         self.ws_subscribed_remarkets = False
 
-        self.external_data:        dict[str, list[dict[str, Any]]] = {}
-        self.external_last_update: datetime | None = None
-        self.external_errors:      dict[str, str]  = {}
-
-        # Token Veta (dura 24hs)
         self._veta_token:    str | None = None
-        self._veta_account:  str = ""
         self._veta_user:     str = ""
         self._veta_password: str = ""
 
+        self.external_data:        dict[str, list[dict[str, Any]]] = {}
+        self.external_last_update: datetime | None = None
+        self.external_errors:      dict[str, str]  = {}
         self._md_lock = threading.Lock()
 
     @property
@@ -119,10 +102,9 @@ class RofexManager:
 
     @property
     def snapshot_finished(self) -> bool:
-        """True si ambos snapshots (los que aplican) terminaron."""
-        veta_done = self.snapshot_finished_veta or not self.symbols_veta
-        rm_done   = self.snapshot_finished_remarkets or not self.symbols_remarkets
-        return veta_done and rm_done
+        v = self.snapshot_finished_veta or not self.symbols_veta
+        r = self.snapshot_finished_remarkets or not self.symbols_remarkets
+        return v and r
 
     @classmethod
     def get(cls) -> "RofexManager":
@@ -131,7 +113,6 @@ class RofexManager:
                 cls._instance = cls()
             return cls._instance
 
-    # ── Inicialización ────────────────────────────────────────────────────────
     def initialize(self) -> None:
         if self.initialized:
             return
@@ -139,10 +120,9 @@ class RofexManager:
         veta_user     = _env("VETA_USER")
         veta_password = _env("VETA_PASSWORD")
         veta_account  = _env("VETA_ACCOUNT")
-
-        rm_user     = _env("PYROFEX_USER")
-        rm_password = _env("PYROFEX_PASSWORD")
-        rm_account  = _env("PYROFEX_ACCOUNT")
+        rm_user       = _env("PYROFEX_USER")
+        rm_password   = _env("PYROFEX_PASSWORD")
+        rm_account    = _env("PYROFEX_ACCOUNT")
 
         veta_ok      = bool(veta_user and veta_password and veta_account)
         remarkets_ok = bool(rm_user and rm_password and rm_account)
@@ -151,24 +131,17 @@ class RofexManager:
             self.error = "Faltan credenciales VETA o PYROFEX"
             return
 
-        # ── Conectar Veta via pyRofex (LIVE environment) ──────────────────────
         if veta_ok:
-            try:
-                pyRofex.initialize(
-                    user=veta_user,
-                    password=veta_password,
-                    account=veta_account,
-                    environment=pyRofex.Environment.LIVE,
-                    url=VETA_BASE_URL,
-                    websocket_url=VETA_WS_URL,
-                )
-                logger.info("Conectado a VETA (LIVE) OK")
-                self._veta_discover_instruments_pyrofex()
-            except Exception as e:
-                logger.exception("Fallo Veta LIVE: %s", e)
-                self.error = f"Veta: {e}"
+            self._veta_user     = veta_user
+            self._veta_password = veta_password
+            token = self._veta_login()
+            if token:
+                self._veta_token = token
+                logger.info("Veta token OK")
+                self._veta_discover()
+            else:
+                self.error = "Veta: no se pudo obtener token"
 
-        # ── Conectar Remarkets via pyRofex (granos) ───────────────────────────
         if remarkets_ok:
             try:
                 pyRofex.initialize(
@@ -177,141 +150,61 @@ class RofexManager:
                     account=rm_account,
                     environment=pyRofex.Environment.REMARKET,
                 )
-                logger.info("Conectado a REMARKETS OK")
-                self._remarkets_discover_instruments()
+                logger.info("Remarkets OK")
+                self._remarkets_discover()
             except Exception as e:
                 logger.exception("Fallo Remarkets: %s", e)
                 self.error = (self.error + f" | Remarkets: {e}") if self.error else f"Remarkets: {e}"
 
-        self.symbols = sorted(set(self.symbols_veta + self.symbols_remarkets))
+        self.symbols   = sorted(set(self.symbols_veta + self.symbols_remarkets))
         self.initialized = True
-        logger.info(
-            "RofexManager listo — Veta DLR: %d, Remarkets granos: %d",
-            len(self.symbols_veta), len(self.symbols_remarkets),
-        )
+        logger.info("RofexManager listo — Veta DLR: %d, Remarkets granos: %d",
+                    len(self.symbols_veta), len(self.symbols_remarkets))
 
         if veta_ok and self._veta_token and self.symbols_veta:
-            threading.Thread(target=self._veta_snapshot_and_ws, daemon=True).start()
+            threading.Thread(target=self._veta_run, daemon=True).start()
 
         if remarkets_ok and self.symbols_remarkets:
-            threading.Thread(target=self._remarkets_snapshot_and_ws, daemon=True).start()
+            threading.Thread(target=self._remarkets_run, daemon=True).start()
 
         threading.Thread(target=self._external_polling_loop, daemon=True).start()
 
-    # ── Veta: autenticación ───────────────────────────────────────────────────
-    def _veta_get_token(self, user: str, password: str) -> str | None:
+    def _veta_login(self) -> str | None:
         try:
             resp = requests.post(
                 f"{VETA_API}/auth/getToken",
-                headers={
-                    "X-Username": user,
-                    "X-Password": password,
-                },
+                headers={"X-Username": self._veta_user, "X-Password": self._veta_password},
                 timeout=10,
             )
-            resp.raise_for_status()
-            # El token viene en el header X-Auth-Token, no en el body
             token = resp.headers.get("X-Auth-Token")
             if token:
-                logger.info("Token Veta obtenido OK")
                 return token
-            logger.error("Veta: X-Auth-Token no encontrado en headers. Headers: %s", dict(resp.headers))
+            logger.error("Veta: X-Auth-Token no encontrado. Status=%s body=%s",
+                        resp.status_code, resp.text[:200])
             return None
         except Exception as e:
-            logger.exception("Veta getToken falló: %s", e)
+            logger.exception("Veta login falló: %s", e)
             return None
 
-    # ── Veta: descubrimiento via pyRofex ─────────────────────────────────────
-    def _veta_discover_instruments_pyrofex(self) -> None:
-        resp        = pyRofex.get_all_instruments()
-        instruments = resp.get("instruments", []) if isinstance(resp, dict) else []
-        for inst in instruments:
-            ident  = inst.get("instrumentId", {}) if isinstance(inst, dict) else {}
-            symbol = ident.get("symbol")
-            if not symbol or _classify(symbol) != "DOLAR":
-                continue
-            self.instrument_meta[symbol] = {
-                "symbol":     symbol,
-                "category":   "DOLAR",
-                "underlying": symbol.split("/")[0],
-                "source":     "VETA",
-            }
-            db.upsert_instrument({"symbol": symbol, "category": "DOLAR", "underlying": "DLR"})
-            self.symbols_veta.append(symbol)
-        self.symbols_veta = sorted(set(self.symbols_veta))
-        logger.info("Veta DLR descubiertos: %d", len(self.symbols_veta))
-
-    # ── Veta: snapshot REST via pyRofex ──────────────────────────────────────
-    def _veta_snapshot_and_ws(self) -> None:
-        threading.Thread(target=self._veta_token_refresh_loop, daemon=True).start()
-        threading.Thread(target=self._veta_connect_ws_pyrofex, daemon=True).start()
-
-        self.snapshot_total += len(self.symbols_veta)
-        logger.info("Snapshot Veta: %d instrumentos", len(self.symbols_veta))
-        for symbol in self.symbols_veta:
-            try:
-                resp = pyRofex.get_market_data(ticker=symbol, entries=_MD_ENTRIES)
-                if not isinstance(resp, dict) or resp.get("status") != "OK":
-                    continue
-                row = self._parse_md(symbol, resp.get("marketData") or {})
-                with self._md_lock:
-                    self.market_data[symbol] = {**self.market_data.get(symbol, {}), **row}
-                    self.last_update = datetime.now(tz=timezone.utc)
-                db.insert_tick(self._tick_row(row))
-                self.snapshot_saved += 1
-            except Exception:
-                logger.exception("Snapshot Veta error en %s", symbol)
-            finally:
-                self.snapshot_done += 1
-                time.sleep(SNAPSHOT_SLEEP_VETA)
-        self.snapshot_finished_veta = True
-        logger.info("Snapshot Veta completo")
-
-    def _veta_connect_ws_pyrofex(self) -> None:
-        """WebSocket de Veta usando pyRofex (igual que Remarkets)."""
-        while True:
-            try:
-                pyRofex.init_websocket_connection(
-                    market_data_handler=self._on_market_data,
-                    error_handler=lambda m: self._on_ws_error("VETA", m),
-                    exception_handler=lambda e: self._on_ws_exc("VETA", e),
-                )
-                pyRofex.market_data_subscription(
-                    tickers=self.symbols_veta,
-                    entries=_MD_ENTRIES,
-                )
-                self.ws_subscribed_veta = True
-                logger.info("Veta WS suscripto a %d DLR", len(self.symbols_veta))
-                while self.ws_subscribed_veta:
-                    try:
-                        pyRofex.heartbeat()
-                    except Exception as e:
-                        logger.warning("Veta heartbeat falló: %s", e)
-                        self.ws_subscribed_veta = False
-                        break
-                    time.sleep(30)
-            except Exception:
-                logger.exception("Veta WS falló — reintentando en 30s")
-            self.ws_subscribed_veta = False
-            time.sleep(30)
+    def _veta_discover(self) -> None:
         try:
             resp = requests.get(
                 f"{VETA_API}/rest/instruments/all",
                 headers={"X-Auth-Token": self._veta_token},
+                params={"marketId": VETA_MARKET},
                 timeout=15,
             )
-            resp.raise_for_status()
             data = resp.json()
-            instruments = data.get("instruments", data) if isinstance(data, dict) else data
-            for inst in (instruments or []):
-                ident  = inst.get("instrumentId", {}) if isinstance(inst, dict) else {}
-                symbol = ident.get("symbol") or inst.get("symbol")
+            instruments = data.get("instruments", []) if isinstance(data, dict) else []
+            for inst in instruments:
+                iid    = inst.get("instrumentId", {}) if isinstance(inst, dict) else {}
+                symbol = iid.get("symbol")
                 if not symbol or _classify(symbol) != "DOLAR":
                     continue
                 self.instrument_meta[symbol] = {
                     "symbol":     symbol,
                     "category":   "DOLAR",
-                    "underlying": symbol.split("/")[0],
+                    "underlying": "DLR",
                     "source":     "VETA",
                 }
                 db.upsert_instrument({"symbol": symbol, "category": "DOLAR", "underlying": "DLR"})
@@ -321,126 +214,74 @@ class RofexManager:
         except Exception as e:
             logger.exception("Veta discover falló: %s", e)
 
-    # ── Veta: snapshot REST ───────────────────────────────────────────────────
-    def _veta_snapshot_and_ws(self) -> None:
-        # Renueva el token cada 23 horas en background
-        threading.Thread(target=self._veta_token_refresh_loop, daemon=True).start()
-        # Arranca el WebSocket en paralelo mientras hace el snapshot
-        threading.Thread(target=self._veta_connect_ws, daemon=True).start()
+    def _veta_run(self) -> None:
+        threading.Thread(target=self._veta_token_loop, daemon=True).start()
 
+        # Snapshot inicial
         self.snapshot_total += len(self.symbols_veta)
-
-    def _veta_token_refresh_loop(self) -> None:
-        """Renueva el token de Veta cada 23 horas (el token dura 24hs)."""
-        while True:
-            time.sleep(23 * 3600)
-            logger.info("Renovando token Veta...")
-            new_token = self._veta_get_token(self._veta_user, self._veta_password)
-            if new_token:
-                self._veta_token = new_token
-                logger.info("Token Veta renovado OK")
-            else:
-                logger.error("Falló renovación de token Veta")
         logger.info("Snapshot Veta: %d instrumentos", len(self.symbols_veta))
-
-        entries_param = ",".join(_MD_ENTRY_CODES)
         for symbol in self.symbols_veta:
             try:
-                resp = requests.get(
-                    f"{VETA_API}/rest/marketdata/get",
-                    headers={"X-Auth-Token": self._veta_token},
-                    params={"ticker": symbol, "entries": entries_param},
-                    timeout=3,
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    md   = data.get("marketData", {}) or {}
-                    row  = self._parse_md(symbol, md)
+                md = self._veta_fetch_one(symbol)
+                if md:
                     with self._md_lock:
-                        self.market_data[symbol] = {**self.market_data.get(symbol, {}), **row}
+                        self.market_data[symbol] = {**self.market_data.get(symbol, {}), **md}
                         self.last_update = datetime.now(tz=timezone.utc)
-                    db.insert_tick(self._tick_row(row))
+                    db.insert_tick(self._tick_row(md))
                     self.snapshot_saved += 1
             except Exception:
-                logger.exception("Snapshot Veta error en %s", symbol)
+                pass
             finally:
                 self.snapshot_done += 1
-                time.sleep(SNAPSHOT_SLEEP)
+                time.sleep(0.1)
 
         self.snapshot_finished_veta = True
-        logger.info("Snapshot Veta completo")
+        logger.info("Snapshot Veta completo — iniciando polling cada %ds", VETA_POLL_SECS)
 
-    # ── Veta: WebSocket ───────────────────────────────────────────────────────
-    def _veta_connect_ws(self) -> None:
-        try:
-            import websocket
-        except ImportError:
-            logger.error("websocket-client no instalado — Veta WS no disponible")
-            return
-
-        def _on_open(ws: Any) -> None:
-            # Autenticar y suscribir
-            ws.send(json.dumps({"type": "auth", "token": self._veta_token}))
-            msg = {
-                "type": "md",
-                "entries": _MD_ENTRY_CODES,
-                "tickers": self.symbols_veta,
-            }
-            ws.send(json.dumps(msg))
-            self.ws_subscribed_veta = True
-            logger.info("Veta WS conectado y suscripto")
-
-        def _on_message(ws: Any, raw: str) -> None:
-            try:
-                msg = json.loads(raw)
-                # Heartbeat de vuelta
-                if msg.get("type") == "heartbeat":
-                    ws.send(json.dumps({"type": "heartbeat"}))
-                    return
-                symbol = (msg.get("instrumentId") or {}).get("symbol") or msg.get("symbol")
-                if not symbol:
-                    return
-                md  = msg.get("marketData") or {}
-                row = self._parse_md(symbol, md)
-                with self._md_lock:
-                    merged = {**self.market_data.get(symbol, {})}
-                    for k, v in row.items():
-                        if v is not None:
-                            merged[k] = v
-                    self._recalc_change(merged)
-                    merged["ts"]     = datetime.now(tz=timezone.utc).isoformat()
-                    merged["symbol"] = symbol
-                    self.market_data[symbol] = merged
-                    self.last_update = datetime.now(tz=timezone.utc)
-                db.insert_tick(self._tick_row(merged))
-            except Exception:
-                logger.exception("Veta WS mensaje error")
-
-        def _on_error(ws: Any, err: Any) -> None:
-            logger.error("Veta WS error: %s", err)
-            self.ws_subscribed_veta = False
-
-        def _on_close(ws: Any, *args: Any) -> None:
-            logger.warning("Veta WS cerrado — reconectando en 30s")
-            self.ws_subscribed_veta = False
-
+        # Polling continuo
         while True:
-            try:
-                ws = websocket.WebSocketApp(
-                    VETA_WS,
-                    on_open=_on_open,
-                    on_message=_on_message,
-                    on_error=_on_error,
-                    on_close=_on_close,
-                )
-                ws.run_forever(ping_interval=30, ping_timeout=10)
-            except Exception:
-                logger.exception("Veta WS run_forever falló")
-            self.ws_subscribed_veta = False
-            time.sleep(30)
+            for symbol in self.symbols_veta:
+                try:
+                    md = self._veta_fetch_one(symbol)
+                    if md:
+                        with self._md_lock:
+                            merged = {**self.market_data.get(symbol, {})}
+                            for k, v in md.items():
+                                if v is not None:
+                                    merged[k] = v
+                            self._recalc(merged)
+                            merged["ts"]     = datetime.now(tz=timezone.utc).isoformat()
+                            merged["symbol"] = symbol
+                            self.market_data[symbol] = merged
+                            self.last_update = datetime.now(tz=timezone.utc)
+                        self.ws_subscribed_veta = True
+                except Exception:
+                    pass
+            time.sleep(VETA_POLL_SECS)
 
-    # ── Remarkets: descubrimiento ─────────────────────────────────────────────
-    def _remarkets_discover_instruments(self) -> None:
+    def _veta_fetch_one(self, symbol: str) -> dict[str, Any] | None:
+        resp = requests.get(
+            f"{VETA_API}/rest/marketdata/get",
+            headers={"X-Auth-Token": self._veta_token},
+            params={"symbol": symbol, "marketId": VETA_MARKET, "entries": _MD_ENTRIES_VETA},
+            timeout=4,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if data.get("status") != "OK":
+            return None
+        return self._parse_veta_md(symbol, data.get("marketData") or {})
+
+    def _veta_token_loop(self) -> None:
+        while True:
+            time.sleep(23 * 3600)
+            new = self._veta_login()
+            if new:
+                self._veta_token = new
+                logger.info("Token Veta renovado")
+
+    def _remarkets_discover(self) -> None:
         resp        = pyRofex.get_all_instruments()
         instruments = resp.get("instruments", []) if isinstance(resp, dict) else []
         for inst in instruments:
@@ -454,57 +295,52 @@ class RofexManager:
                 "underlying": symbol.split("/")[0],
                 "source":     "REMARKETS",
             }
-            db.upsert_instrument({"symbol": symbol, "category": "GRANO", "underlying": symbol.split("/")[0]})
+            db.upsert_instrument({"symbol": symbol, "category": "GRANO",
+                                  "underlying": symbol.split("/")[0]})
             self.symbols_remarkets.append(symbol)
         self.symbols_remarkets = sorted(set(self.symbols_remarkets))
-        logger.info("Remarkets granos descubiertos: %d", len(self.symbols_remarkets))
+        logger.info("Remarkets granos: %d", len(self.symbols_remarkets))
 
-    # ── Remarkets: snapshot + WS ──────────────────────────────────────────────
-    def _remarkets_snapshot_and_ws(self) -> None:
-        # Arranca el WebSocket en paralelo mientras hace el snapshot
-        threading.Thread(target=self._remarkets_connect_ws, daemon=True).start()
+    def _remarkets_run(self) -> None:
+        threading.Thread(target=self._remarkets_ws, daemon=True).start()
 
         self.snapshot_total += len(self.symbols_remarkets)
-        logger.info("Snapshot Remarkets: %d instrumentos", len(self.symbols_remarkets))
         for symbol in self.symbols_remarkets:
             try:
-                resp = pyRofex.get_market_data(ticker=symbol, entries=_MD_ENTRIES)
-                if not isinstance(resp, dict) or resp.get("status") != "OK":
-                    continue
-                row = self._parse_md(symbol, resp.get("marketData") or {})
-                with self._md_lock:
-                    self.market_data[symbol] = {**self.market_data.get(symbol, {}), **row}
-                    self.last_update = datetime.now(tz=timezone.utc)
-                db.insert_tick(self._tick_row(row))
-                self.snapshot_saved += 1
+                resp = pyRofex.get_market_data(ticker=symbol, entries=_MD_ENTRIES_PYROFEX)
+                if isinstance(resp, dict) and resp.get("status") == "OK":
+                    row = self._parse_pyrofex_md(symbol, resp.get("marketData") or {})
+                    with self._md_lock:
+                        self.market_data[symbol] = {**self.market_data.get(symbol, {}), **row}
+                        self.last_update = datetime.now(tz=timezone.utc)
+                    db.insert_tick(self._tick_row(row))
+                    self.snapshot_saved += 1
             except Exception:
-                logger.exception("Snapshot Remarkets error en %s", symbol)
+                pass
             finally:
                 self.snapshot_done += 1
-                time.sleep(SNAPSHOT_SLEEP)
+                time.sleep(0.1)
         self.snapshot_finished_remarkets = True
         logger.info("Snapshot Remarkets completo")
 
-    def _remarkets_connect_ws(self) -> None:
+    def _remarkets_ws(self) -> None:
         while True:
             try:
                 pyRofex.init_websocket_connection(
                     market_data_handler=self._on_remarkets_md,
-                    error_handler=self._on_remarkets_error,
-                    exception_handler=self._on_remarkets_exc,
+                    error_handler=lambda m: setattr(self, 'ws_subscribed_remarkets', False),
+                    exception_handler=lambda e: setattr(self, 'ws_subscribed_remarkets', False),
                 )
                 pyRofex.market_data_subscription(
                     tickers=self.symbols_remarkets,
-                    entries=_MD_ENTRIES,
+                    entries=_MD_ENTRIES_PYROFEX,
                 )
                 self.ws_subscribed_remarkets = True
                 logger.info("Remarkets WS suscripto a %d granos", len(self.symbols_remarkets))
-                # Heartbeat loop
                 while self.ws_subscribed_remarkets:
                     try:
                         pyRofex.heartbeat()
-                    except Exception as e:
-                        logger.warning("Remarkets heartbeat falló: %s", e)
+                    except Exception:
                         self.ws_subscribed_remarkets = False
                         break
                     time.sleep(30)
@@ -518,30 +354,21 @@ class RofexManager:
             symbol = (message.get("instrumentId") or {}).get("symbol")
             if not symbol:
                 return
-            row = self._parse_md(symbol, message.get("marketData") or {})
+            row = self._parse_pyrofex_md(symbol, message.get("marketData") or {})
             with self._md_lock:
                 merged = {**self.market_data.get(symbol, {})}
                 for k, v in row.items():
                     if v is not None:
                         merged[k] = v
-                self._recalc_change(merged)
+                self._recalc(merged)
                 merged["ts"]     = datetime.now(tz=timezone.utc).isoformat()
                 merged["symbol"] = symbol
                 self.market_data[symbol] = merged
                 self.last_update = datetime.now(tz=timezone.utc)
             db.insert_tick(self._tick_row(merged))
         except Exception:
-            logger.exception("Error procesando Remarkets market data")
+            logger.exception("Error procesando Remarkets MD")
 
-    def _on_remarkets_error(self, message: Any) -> None:
-        logger.error("Remarkets WS error: %s", message)
-        self.ws_subscribed_remarkets = False
-
-    def _on_remarkets_exc(self, exc: Exception) -> None:
-        logger.exception("Remarkets WS exception: %s", exc)
-        self.ws_subscribed_remarkets = False
-
-    # ── Polling externo (data912) ─────────────────────────────────────────────
     def _external_polling_loop(self) -> None:
         while True:
             for key, url in EXTERNAL_API_URLS.items():
@@ -558,37 +385,62 @@ class RofexManager:
                 except Exception as e:
                     with self._md_lock:
                         self.external_errors[key] = str(e)
-                    logger.warning("Fallo %s: %s", key, e)
             time.sleep(EXTERNAL_REFRESH_SECS)
 
     def get_external(self, key: str) -> list[dict[str, Any]]:
         with self._md_lock:
             return list(self.external_data.get(key, []))
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
-    @staticmethod
-    def _recalc_change(merged: dict[str, Any]) -> None:
-        prev = merged.get("settlement_price") or merged.get("closing_price")
-        ref  = merged.get("last_price") or merged.get("offer") or merged.get("bid")
-        if prev and ref:
-            try:
-                merged["change_pct"] = (ref - prev) / prev * 100
-            except ZeroDivisionError:
-                merged["change_pct"] = None
-        merged["prev_close"] = prev
+    def _parse_veta_md(self, symbol: str, md: dict[str, Any]) -> dict[str, Any]:
+        def _v(key: str) -> float | None:
+            obj = md.get(key)
+            if obj is None:                 return None
+            if isinstance(obj, (int, float)): return float(obj)
+            if isinstance(obj, dict):       return obj.get("price") or obj.get("size")
+            if isinstance(obj, list) and obj:
+                f = obj[0]
+                if isinstance(f, dict):     return f.get("price")
+            return None
 
-    def _parse_md(self, symbol: str, md: dict[str, Any]) -> dict[str, Any]:
+        last_price  = _v("LA")
+        bid_price   = _v("BI")
+        offer_price = _v("OF")
+        settlement  = _v("SE")
+        closing     = _v("CL")
+        trade_vol   = _v("TV")
+        open_int    = _v("OI")
+        prev_close  = settlement or closing
+        ref         = last_price or offer_price or bid_price
+        change_pct  = None
+        if prev_close and ref:
+            try:
+                change_pct = (ref - prev_close) / prev_close * 100
+            except ZeroDivisionError:
+                pass
+        return {
+            "symbol":           symbol,
+            "ts":               datetime.now(tz=timezone.utc).isoformat(),
+            "last_price":       last_price,
+            "bid":              bid_price,
+            "offer":            offer_price,
+            "settlement_price": settlement,
+            "closing_price":    closing,
+            "trade_volume":     trade_vol,
+            "open_interest":    open_int,
+            "prev_close":       prev_close,
+            "change_pct":       change_pct,
+        }
+
+    def _parse_pyrofex_md(self, symbol: str, md: dict[str, Any]) -> dict[str, Any]:
         last_price  = _price(md, "LA")
         bid_price   = _price(md, "BI")
         bid_size    = _size(md,  "BI")
         offer_price = _price(md, "OF")
         offer_size  = _size(md,  "OF")
-        opening     = _val(md,   "OP")
         closing     = _val(md,   "CL")
         settlement  = _val(md,   "SE")
         trade_vol   = _val(md,   "TV")
         open_int    = _val(md,   "OI")
-        nominal_vol = _val(md,   "NV")
         prev_close  = settlement or closing
         ref         = last_price or offer_price or bid_price
         change_pct  = None
@@ -605,15 +457,24 @@ class RofexManager:
             "bid_size":         bid_size,
             "offer":            offer_price,
             "offer_size":       offer_size,
-            "opening_price":    opening,
             "closing_price":    closing,
             "settlement_price": settlement,
             "trade_volume":     trade_vol,
             "open_interest":    open_int,
-            "nominal_volume":   nominal_vol,
             "prev_close":       prev_close,
             "change_pct":       change_pct,
         }
+
+    @staticmethod
+    def _recalc(merged: dict[str, Any]) -> None:
+        prev = merged.get("settlement_price") or merged.get("closing_price")
+        ref  = merged.get("last_price") or merged.get("offer") or merged.get("bid")
+        if prev and ref:
+            try:
+                merged["change_pct"] = (ref - prev) / prev * 100
+            except ZeroDivisionError:
+                merged["change_pct"] = None
+        merged["prev_close"] = prev
 
     @staticmethod
     def _tick_row(r: dict[str, Any]) -> dict[str, Any]:
@@ -640,10 +501,8 @@ class RofexManager:
             ]
 
 
-# ── Helpers de extracción ─────────────────────────────────────────────────────
 def _env(key: str) -> str:
     return (os.environ.get(key) or "").strip().strip('"').strip("'")
-
 
 def _price(entries: dict, key: str) -> float | None:
     v = entries.get(key)
@@ -654,7 +513,6 @@ def _price(entries: dict, key: str) -> float | None:
     if isinstance(v, (int, float)): return float(v)
     return None
 
-
 def _size(entries: dict, key: str) -> float | None:
     v = entries.get(key)
     if isinstance(v, dict):         return v.get("size")
@@ -662,7 +520,6 @@ def _size(entries: dict, key: str) -> float | None:
         f = v[0]
         if isinstance(f, dict):     return f.get("size")
     return None
-
 
 def _val(entries: dict, key: str) -> float | None:
     v = entries.get(key)
