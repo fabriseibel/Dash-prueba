@@ -514,11 +514,13 @@ def _render_dolares_financieros(
     spot_pct = None
     spot_prev = None
     if dlr_spot_row:
-        spot = dlr_spot_row.get("last_price") or dlr_spot_row.get("offer") or dlr_spot_row.get("bid")
+        spot = (dlr_spot_row.get("last_price") or 
+                dlr_spot_row.get("offer") or 
+                dlr_spot_row.get("bid") or
+                dlr_spot_row.get("prev_close") or
+                dlr_spot_row.get("closing_price"))
         spot_pct = dlr_spot_row.get("change_pct")
-        spot_prev = dlr_spot_row.get("prev_close")
-        if spot is None and spot_prev and spot_pct is not None:
-            spot = spot_prev * (1 + spot_pct / 100)
+        spot_prev = dlr_spot_row.get("prev_close") or dlr_spot_row.get("closing_price")
 
     # Brecha MEP / A3500
     brecha_mep_spot = None
