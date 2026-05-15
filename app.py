@@ -514,13 +514,11 @@ def _render_dolares_financieros(
     spot_pct = None
     spot_prev = None
     if dlr_spot_row:
-                spot = (dlr_spot_row.get("last_price") or 
-                        dlr_spot_row.get("offer") or 
-                        dlr_spot_row.get("bid") or
-                        dlr_spot_row.get("prev_close") or
-                        dlr_spot_row.get("closing_price"))
-                spot_pct = dlr_spot_row.get("change_pct")
-                spot_prev = dlr_spot_row.get("prev_close") or dlr_spot_row.get("closing_price")
+        spot = dlr_spot_row.get("last_price") or dlr_spot_row.get("offer") or dlr_spot_row.get("bid")
+        spot_pct = dlr_spot_row.get("change_pct")
+        spot_prev = dlr_spot_row.get("prev_close")
+        if spot is None and spot_prev and spot_pct is not None:
+            spot = spot_prev * (1 + spot_pct / 100)
 
     # Brecha MEP / A3500
     brecha_mep_spot = None
@@ -862,20 +860,8 @@ def main() -> None:
         st.header("Estado")
         if mgr.error:
             st.error(mgr.error)
-        if mgr.initialized:
-            if mgr.ws_subscribed_veta:
-                st.success(f"✓ Veta (DLR): {len(mgr.symbols_veta)} contratos")
-            elif mgr.symbols_veta:
-                st.warning(f"⏳ Veta (DLR): conectando... {len(mgr.symbols_veta)} contratos")
-            else:
-                st.error("✗ Veta (DLR): sin conexión")
-
-            if mgr.ws_subscribed_remarkets:
-                st.success(f"✓ Remarkets (Granos): {len(mgr.symbols_remarkets)} contratos")
-            elif mgr.symbols_remarkets:
-                st.warning(f"⏳ Remarkets (Granos): conectando... {len(mgr.symbols_remarkets)} contratos")
-            else:
-                st.error("✗ Remarkets (Granos): sin conexión")
+        elif mgr.initialized:
+            st.success("Conectado a REMARKETS")
         else:
             st.warning("Inicializando...")
 
