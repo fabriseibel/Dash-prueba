@@ -1,6 +1,6 @@
 """Dashboard Streamlit: precios en tiempo real de dólares y granos
 desde Matba Rofex (pyRofex WebSocket) con persistencia en Supabase."""
-from __future annotations
+from __future__ import annotations
 
 import time
 from calendar import monthrange
