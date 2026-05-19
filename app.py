@@ -5,6 +5,7 @@ Diseño basado en tarjetas dinámicas que se refrescan automáticamente
 a medida que entran nuevos ticks (desde el WebSocket → memoria + Supabase)."""
 from __future__ import annotations
 
+import time
 from calendar import monthrange
 from collections import defaultdict
 from datetime import date, datetime
@@ -15,7 +16,7 @@ import streamlit as st
 
 import db
 from rofex_manager import RofexManager
-from symbol_utils import keep_for_dashboard, display_symbol, parse_symbol, sort_key
+from symbol_utils import keep_for_dashboard, display_symbol, parse_symbol, sort_key, obtener_dolar_mayorista_realtime
 
 st.set_page_config(
     page_title="Matba Rofex Dashboard",
@@ -46,7 +47,7 @@ CARD_CSS = """
 }
 .metric-card.positive { border-left: 4px solid #16a34a; }
 .metric-card.negative { border-left: 4px solid #dc2626; }
-.metric-card.neutral  { border-left: 4px solid #9ca3af; }
+.metric-card.neutral  { border-left: 4px solid #9ca3af; }
 
 .metric-card .symbol {
     font-size: 0.85rem;
@@ -72,7 +73,7 @@ CARD_CSS = """
 }
 .metric-card .change.positive { color: #16a34a; }
 .metric-card .change.negative { color: #dc2626; }
-.metric-card .change.neutral  { color: #6b7280; }
+.metric-card .change.neutral  { color: #6b7280; }
 
 .metric-card .abs-change {
     font-size: 0.85rem;
@@ -439,10 +440,10 @@ def _render_dolares_financieros(
     mep_rows: list[dict],
     ccl_rows: list[dict],
     bonos_rows: list[dict],
-    dlr_spot_row: dict | None = None,
+    spot_from_api: float | None = None,
 ) -> None:
     """Calcula MEP y CCL desde arg_bonds usando AL30, AL30C y AL30D.
-    Muestra también el Dólar A3500 (DLR/SPOT de pyRofex) y brechas.
+    Muestra también el Dólar A3500 (desde DolarApi en tiempo real) y brechas.
 
     MEP = AL30 (ARS) ÷ AL30D (USD MEP)
     CCL = AL30 (ARS) ÷ AL30C (USD cable)
@@ -453,7 +454,7 @@ def _render_dolares_financieros(
         if r.get("symbol")
     }
 
-    al30  = bonds_by_symbol.get("AL30")
+    al30  = bonds_by_symbol.get("AL30")
     al30c = bonds_by_symbol.get("AL30C")
     al30d = bonds_by_symbol.get("AL30D")
 
@@ -466,7 +467,7 @@ def _render_dolares_financieros(
         except (TypeError, ValueError):
             return None
 
-    p_al30  = _price(al30)
+    p_al30  = _price(al30)
     p_al30c = _price(al30c)
     p_al30d = _price(al30d)
 
@@ -487,7 +488,7 @@ def _render_dolares_financieros(
         except (TypeError, ValueError):
             return None
 
-    pct_al30  = _pct(al30)
+    pct_al30  = _pct(al30)
     pct_al30c = _pct(al30c)
     pct_al30d = _pct(al30d)
 
@@ -509,20 +510,10 @@ def _render_dolares_financieros(
     if mep and ccl and mep > 0:
         brecha_ccl_mep = (ccl / mep - 1) * 100
 
-    # Dólar A3500 desde pyRofex (DLR/SPOT)
-    spot = None
-    spot_pct = None
-    spot_prev = None
-    if dlr_spot_row:
-        spot = (dlr_spot_row.get("last_price") or dlr_spot_row.get("offer") or
-                dlr_spot_row.get("bid") or dlr_spot_row.get("prev_close") or
-                dlr_spot_row.get("closing_price"))
-        spot_prev = dlr_spot_row.get("prev_close") or dlr_spot_row.get("closing_price")
-        if spot and spot_prev:
-            try: spot_pct = (spot - spot_prev) / spot_prev * 100
-            except: spot_pct = dlr_spot_row.get("change_pct")
-        else:
-            spot_pct = dlr_spot_row.get("change_pct")
+    # Usamos directamente el spot traído de DolarApi
+    spot = spot_from_api
+    spot_pct = 0.0  # DolarApi provee el intradiario neto, seteamos neutro o podés calcular variación si guardás el cierre
+    spot_prev = spot
 
     # Brecha MEP / A3500
     brecha_mep_spot = None
@@ -535,7 +526,7 @@ def _render_dolares_financieros(
     )
 
     def _fin_card(label: str, precio: float | None, pct: float | None,
-                  prev: float | None, sub: str) -> str:
+                  prev: float | None, sub: str) -> str:
         price_str = f"${precio:,.2f}" if precio else "—"
         change_text, change_cls = _fmt_change(pct)
         abs_change = _fmt_abs_change(precio, prev)
@@ -566,7 +557,6 @@ def _render_dolares_financieros(
         </div>
         """
 
-    # Layout: MEP | A3500 | CCL | [Brecha CCL/MEP encima / Brecha MEP/A3500 abajo]
     col_mep, col_spot, col_ccl, col_brechas = st.columns(4)
 
     with col_mep:
@@ -574,7 +564,7 @@ def _render_dolares_financieros(
         st.markdown(_fin_card("Dólar MEP", mep, mep_pct, mep_prev, sub_mep), unsafe_allow_html=True)
 
     with col_spot:
-        sub_spot = "DLR/SPOT · pyRofex" if spot else "DLR/SPOT · sin datos"
+        sub_spot = "Mayorista · DolarApi tiempo real" if spot else "DolarApi · sin datos"
         st.markdown(_fin_card("Dólar A3500", spot, spot_pct, spot_prev, sub_spot), unsafe_allow_html=True)
 
     with col_ccl:
@@ -596,7 +586,6 @@ def _render_byma_card(item: dict) -> str:
     vol = item.get("v")
     prev_close = item.get("close")
 
-    # Calcular pct_change si no viene o es None
     if pct is None and last and prev_close:
         try:
             pct = (float(last) - float(prev_close)) / float(prev_close) * 100
@@ -624,482 +613,4 @@ def _render_byma_card(item: dict) -> str:
     """
 
 
-# Capitalización de mercado en millones de ARS
-_CAP_MERC: dict[str, float] = {
-    "YPFD": 25270, "GGAL": 10380, "TECO2": 7290, "BMA": 7090, "TGSU2": 6810,
-    "PAMP": 6500, "BBAR": 4410, "CEPU": 3270, "TXAR": 3150, "ALUA": 2780,
-    "BYMA": 2380, "TGNO4": 1870, "LOMA": 1820, "IRSA": 1740, "TRAN": 1700,
-    "EDN": 1670, "BPAT": 1460, "CVH": 1320, "MOLA": 1200, "CRES": 1180,
-    "SUPV": 1170, "METR": 1090, "CAPX": 770.45, "VALO": 768.02, "CTIO": 756.28,
-    "CGPA2": 719.89, "A3": 716.30, "ECOG": 664.77, "GBAN": 659.22, "HARG": 634.56,
-    "PATA": 615, "MOLI": 542, "BHIP": 512.21, "GCLA": 408.42, "LEDE": 342.54,
-    "MIRG": 338.38, "COME": 334.81, "DGCU2": 331.86, "CECO2": 322.91,
-    "AUSO": 318.18, "INVJ": 317.09, "DGCE": 315.3, "HAVA": 277.16,
-    "RICH": 130.41, "GRIM": 122.95, "OEST": 120.48, "BOLT": 109.42,
-    "FERR": 98.11, "GAMI": 92.65, "SAMI": 81.98, "RIGO": 69.49,
-    "CADO": 67.88, "SEMI": 66.42, "AGRO": 54.84, "IEB": 47.6,
-    "INTR": 38.02, "FIPL": 33.6, "CELU": 27.86, "CARC": 25.65,
-    "GCDI": 14.51, "GARO": 11.59, "LONG": 9.82, "MORI": 8.34,
-    "ROSE": 6.94, "POLL": 1.7,
-}
-
-_SECTORES: dict[str, str] = {
-    "YPFD": "Energía", "PAMP": "Energía", "TGSU2": "Energía",
-    "TGNO4": "Energía", "CEPU": "Energía", "TRAN": "Energía",
-    "EDN": "Energía", "CAPX": "Energía", "DGCU2": "Energía",
-    "CECO2": "Energía", "HARG": "Energía", "CGPA2": "Energía",
-    "ROSE": "Energía",
-    "GGAL": "Financiero", "BMA": "Financiero", "BBAR": "Financiero",
-    "SUPV": "Financiero", "VALO": "Financiero", "BYMA": "Financiero",
-    "BHIP": "Financiero", "GCLA": "Financiero", "BPAT": "Financiero",
-    "GBAN": "Financiero", "INVJ": "Financiero", "IEB": "Financiero",
-    "INTR": "Financiero",
-    "TECO2": "Telecom", "CVH": "Telecom", "CTIO": "Telecom",
-    "ALUA": "Materiales", "LOMA": "Materiales", "TXAR": "Materiales",
-    "BOLT": "Materiales", "FERR": "Materiales", "GARO": "Materiales",
-    "CARC": "Materiales",
-    "IRSA": "Real Estate", "MOLA": "Real Estate", "CRES": "Real Estate",
-    "GCDI": "Real Estate", "LONG": "Real Estate",
-    "MOLI": "Consumo", "LEDE": "Consumo", "COME": "Consumo",
-    "RICH": "Consumo", "GRIM": "Consumo", "PATA": "Consumo",
-    "AGRO": "Consumo", "CADO": "Consumo", "POLL": "Consumo",
-    "SAMI": "Consumo", "RIGO": "Consumo", "MORI": "Consumo",
-    "AUSO": "Industrial", "MIRG": "Industrial", "FIPL": "Industrial",
-    "GAMI": "Industrial",
-    "METR": "Utilities", "ECOG": "Utilities", "OEST": "Utilities",
-    "DGCE": "Utilities", "A3": "Utilities",
-    "HAVA": "Salud", "CELU": "Salud",
-    "SEMI": "Tecnología",
-}
-
-
-def _render_heatmap(acciones: list[dict]) -> None:
-    """Treemap de acciones BYMA agrupado por sector.
-    Tamaño = capitalización de mercado. Color = variación % del día."""
-    import plotly.graph_objects as go
-
-    rows = {
-        str(r.get("symbol", "") or r.get("ticker", "")).upper(): r
-        for r in acciones
-        if (r.get("symbol") or r.get("ticker")) and r.get("c")
-    }
-
-    ids, labels, parents, values, colors, custom = [], [], [], [], [], []
-
-    # Calcular cap total por sector para los nodos padre
-    sectores_cap: dict[str, float] = {}
-    for ticker, cap in _CAP_MERC.items():
-        if ticker not in rows:
-            continue
-        sector = _SECTORES.get(ticker, "Otros")
-        sectores_cap[sector] = sectores_cap.get(sector, 0) + cap
-
-    # Nodos padre (sectores)
-    for sector, total_cap in sectores_cap.items():
-        ids.append(sector)
-        labels.append(f"<b>{sector}</b>")
-        parents.append("")
-        values.append(total_cap)
-        colors.append(0.0)
-        custom.append(f"<b>{sector}</b>")
-
-    # Nodos hoja (acciones)
-    for ticker, cap in _CAP_MERC.items():
-        r = rows.get(ticker)
-        if r is None:
-            continue
-        sector = _SECTORES.get(ticker, "Otros")
-        precio = float(r.get("c") or 0)
-        pct    = float(r.get("pct_change") or 0)
-        vol    = int(r.get("v") or 0)
-        ids.append(ticker)
-        labels.append(f"{ticker}<br>{'+'if pct>=0 else ''}{pct:.2f}%")
-        parents.append(sector)
-        values.append(cap)
-        colors.append(pct)
-        custom.append(
-            f"<b>{ticker}</b><br>"
-            f"Precio: ${precio:,.2f}<br>"
-            f"Var: {'+'if pct>=0 else ''}{pct:.2f}%<br>"
-            f"Cap. Merc.: ${cap:,.0f}M<br>"
-            f"Vol: {vol:,}"
-        )
-
-    if not ids:
-        st.info("Sin datos de acciones todavía.")
-        return
-
-    max_abs = max((abs(c) for c in colors if c != 0.0), default=3)
-    max_abs = max(max_abs, 1)
-
-    # Escala estilo Finviz: rojo puro → negro → verde puro
-    colorscale = [
-        [0.0,  "#9A0000"],
-        [0.2,  "#CC0000"],
-        [0.38, "#880000"],
-        [0.48, "#222222"],
-        [0.5,  "#1a1a1a"],
-        [0.52, "#003300"],
-        [0.62, "#007700"],
-        [0.8,  "#00AA00"],
-        [1.0,  "#00CC00"],
-    ]
-
-    fig = go.Figure(go.Treemap(
-        ids=ids,
-        labels=labels,
-        parents=parents,
-        values=values,
-        branchvalues="total",
-        marker=dict(
-            colors=colors,
-            colorscale=colorscale,
-            cmin=-max_abs,
-            cmid=0,
-            cmax=max_abs,
-            showscale=False,
-            line=dict(width=1, color="#000000"),
-        ),
-        customdata=custom,
-        hovertemplate="%{customdata}<extra></extra>",
-        textfont=dict(
-            size=13,
-            color="white",
-            family="Arial Black, Arial, sans-serif",
-        ),
-        textposition="middle center",
-        pathbar=dict(visible=False),
-        tiling=dict(packing="squarify", pad=2),
-    ))
-
-    fig.update_layout(
-        margin=dict(t=0, l=0, r=0, b=0),
-        height=680,
-        paper_bgcolor="#000000",
-        plot_bgcolor="#000000",
-        font=dict(color="white"),
-    )
-
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-
-
-def _render_byma_panel(title: str, emoji: str, items: list[dict],
-                       cols_per_row: int = 4, top_n: int = 60,
-                       buscar: str = "") -> None:
-    """Render generico para acciones, bonos y CEDEARs (fuente data912)."""
-    if buscar:
-        q = buscar.strip().upper()
-        items = [
-            it for it in items
-            if q in str(it.get("ticker") or it.get("ticker_ar") or it.get("symbol") or "").upper()
-        ]
-
-    # Ordeno por monto operado (precio × cantidad) descendente
-    def _monto(it: dict) -> float:
-        price = it.get("c") or it.get("mark") or it.get("close") or 0
-        vol = it.get("v") or it.get("v_ars") or 0
-        try:
-            return float(price) * float(vol)
-        except (TypeError, ValueError):
-            return 0.0
-
-    items_sorted = sorted(items, key=_monto, reverse=True)
-    items_view = items_sorted[:top_n]
-
-    st.markdown(
-        f'<div class="section-title">{emoji} {title} '
-        f'<span class="badge">{len(items_view)} / {len(items)}</span></div>',
-        unsafe_allow_html=True,
-    )
-
-    if not items_view:
-        st.markdown(
-            '<div class="empty-card">Sin datos todavía. Esperando respuesta de data912…</div>',
-            unsafe_allow_html=True,
-        )
-        return
-
-    for start in range(0, len(items_view), cols_per_row):
-        chunk = items_view[start:start + cols_per_row]
-        cols = st.columns(cols_per_row)
-        for col, it in zip(cols, chunk):
-            with col:
-                st.markdown(_render_byma_card(it), unsafe_allow_html=True)
-
-
-def _render_group(title: str, emoji: str, rows: list[dict], cols_per_row: int = 4) -> None:
-    st.markdown(
-        f'<div class="section-title">{emoji} {title} '
-        f'<span class="badge">{len(rows)}</span></div>',
-        unsafe_allow_html=True,
-    )
-
-    if not rows:
-        st.markdown(
-            '<div class="empty-card">Sin datos para mostrar todavía. '
-            "Esperando primeros ticks del mercado…</div>",
-            unsafe_allow_html=True,
-        )
-        return
-
-    for start in range(0, len(rows), cols_per_row):
-        chunk = rows[start:start + cols_per_row]
-        cols = st.columns(cols_per_row)
-        for col, row in zip(cols, chunk):
-            with col:
-                st.markdown(_render_card(row), unsafe_allow_html=True)
-        for col in cols[len(chunk):]:
-            with col:
-                st.empty()
-
-
-
-TABLE_CSS_RAVA = """
-<style>
-.rava-wrap{background:#0f1117;border-radius:12px;padding:16px;margin-bottom:20px}
-.rava-title{font-size:.85rem;font-weight:700;color:#9ca3af;text-transform:uppercase;
-    letter-spacing:.06em;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid #1f2937}
-.rava-table{width:100%;border-collapse:collapse;font-size:.83rem}
-.rava-table th{color:#6b7280;font-weight:600;font-size:.72rem;text-transform:uppercase;
-    letter-spacing:.05em;padding:6px 10px;text-align:right;border-bottom:1px solid #1f2937}
-.rava-table th:first-child{text-align:left}
-.rava-table td{padding:7px 10px;text-align:right;color:#d1d5db;border-bottom:1px solid #1a1f2e;font-weight:500}
-.rava-table td:first-child{text-align:left;color:#f9fafb;font-weight:700}
-.rava-table tr:last-child td{border-bottom:none}
-.rava-table tr:hover td{background:#1a1f2e}
-.rv-pos{color:#22c55e!important;font-weight:700!important}
-.rv-neg{color:#ef4444!important;font-weight:700!important}
-.rv-neu{color:#6b7280!important}
-</style>
-"""
-
-def _render_tabla_rava(titulo, items, symbol_field="symbol", price_field="c",
-                       pct_field="pct_change", vol_field="v", prev_field="close"):
-    def _p(v):
-        if v is None: return '<span class="rv-neu">—</span>'
-        try: return f"{float(v):,.2f}"
-        except: return "—"
-    def _pct(v):
-        if v is None: return '<span class="rv-neu">—</span>'
-        try:
-            f = float(v)
-            cls = "rv-pos" if f>0 else ("rv-neg" if f<0 else "rv-neu")
-            return f'<span class="{cls}>{"+" if f>0 else ""}{f:.2f}%</span>'
-        except: return "—"
-    def _vol(v):
-        if v is None: return '<span class="rv-neu">—</span>'
-        try:
-            vi = int(float(v))
-            if vi>=1_000_000: return f"{vi/1_000_000:.1f}M"
-            if vi>=1_000: return f"{vi/1_000:.0f}K"
-            return str(vi)
-        except: return "—"
-    rows_html = ""
-    for it in items:
-        sym = it.get(symbol_field) or it.get("ticker") or "—"
-        rows_html += f"<tr><td>{sym}</td><td>{_p(it.get(price_field) or it.get('mark'))}</td><td>{_pct(it.get(pct_field))}</td><td>{_vol(it.get(vol_field))}</td><td>{_p(it.get(prev_field))}</td></tr>"
-    if not rows_html:
-        rows_html = '<tr><td colspan="5" style="color:#6b7280;text-align:center;padding:12px;">Sin datos</td></tr>'
-    st.markdown(f"""{TABLE_CSS_RAVA}<div class="rava-wrap"><div class="rava-title">{titulo}</div><table class="rava-table"><thead><tr><th>Especie</th><th>Último</th><th>% Día</th><th>Volumen</th><th>Cierre ant.</th></tr></thead><tbody>{rows_html}</tbody></table></div>""", unsafe_allow_html=True)
-
-def main() -> None:
-    st.markdown(CARD_CSS, unsafe_allow_html=True)
-    st.title("Matba Rofex — Dashboard en tiempo real")
-    st.caption("Dólares y granos · WebSocket pyRofex · persistencia en Supabase")
-
-    mgr = get_manager()
-
-    with st.sidebar:
-        st.header("Estado")
-        if mgr.error:
-            st.error(mgr.error)
-        elif mgr.initialized:
-            st.success("Conectado a REMARKETS")
-        else:
-            st.warning("Inicializando...")
-
-        st.metric("Instrumentos detectados", len(mgr.symbols))
-        if db.is_connected():
-            s = db.stats()
-            st.metric("Supabase", f"✓ ON ({s['ok']} ok / {s['errors']} err)")
-        else:
-            st.metric("Supabase", "✗ OFF")
-            err = db.init_error()
-            if err:
-                st.error(err)
-
-        if mgr.snapshot_total:
-            if mgr.snapshot_finished:
-                st.success(f"Snapshot ✓ {mgr.snapshot_saved}/{mgr.snapshot_total} filas guardadas")
-            else:
-                st.progress(
-                    mgr.snapshot_done / mgr.snapshot_total if mgr.snapshot_total else 0,
-                    text=f"Snapshot REST {mgr.snapshot_done}/{mgr.snapshot_total} (guardados: {mgr.snapshot_saved})",
-                )
-
-        if mgr.ws_subscribed:
-            st.caption("WebSocket suscripto ✓")
-        else:
-            st.caption("WebSocket: conectando...")
-
-        if mgr.last_update:
-            local = mgr.last_update.astimezone(BA_TZ)
-            st.write(f"Último tick: **{local.strftime('%H:%M:%S')}**")
-
-        st.divider()
-        st.subheader("APIs externas (data912)")
-        if mgr.external_last_update:
-            local_ext = mgr.external_last_update.astimezone(BA_TZ)
-            st.caption(f"Última actualización: **{local_ext.strftime('%H:%M:%S')}**")
-        ext_status = []
-        for key in ("MEP", "CCL", "ACCIONES", "BONOS", "CEDEARS"):
-            n = len(mgr.get_external(key))
-            err = mgr.external_errors.get(key)
-            if err:
-                ext_status.append(f"❌ {key}: {err[:40]}")
-            else:
-                ext_status.append(f"✓ {key}: {n} filas")
-        st.caption("\n".join(ext_status))
-
-        st.divider()
-        st.subheader("Filtros")
-        underlyings_disponibles = sorted(
-            {meta.get("underlying", "") for meta in mgr.instrument_meta.values() if meta.get("underlying")}
-        )
-        underlying_filter = st.multiselect(
-            "Subyacente",
-            options=underlyings_disponibles,
-            default=[],
-            help="Vacío = todos",
-        )
-        ocultar_opciones = st.checkbox("Ocultar opciones (calls/puts)", value=True)
-        ocultar_mayorista = st.checkbox("Ocultar contratos Mayorista", value=True)
-        max_pase = st.slider(
-            "Pases: máxima distancia (meses)",
-            min_value=0, max_value=12, value=1,
-            help="0 = sin pases. 1 = solo pases entre meses consecutivos. 12 = mostrar todos.",
-        )
-        buscar = st.text_input("Buscar instrumento", placeholder="ej: DLR/AGO o SOJ.ROS")
-
-        st.divider()
-        cols_per_row = st.slider("Tarjetas por fila", 2, 6, 4)
-        refresh_secs = st.slider("Refresco (seg)", 1, 10, 2)
-
-    if mgr.error:
-        st.stop()
-
-    placeholder = st.empty()
-
-    @st.fragment(run_every=refresh_secs)
-    def render():
-        rows = mgr.snapshot()
-
-        if underlying_filter:
-            rows = [r for r in rows if r.get("underlying") in underlying_filter]
-
-        rows = [
-            r for r in rows
-            if keep_for_dashboard(
-                r.get("symbol", ""),
-                max_spread_gap=max_pase,
-                hide_options=ocultar_opciones,
-                hide_mayorista=ocultar_mayorista,
-            )
-        ]
-
-        if buscar:
-            q = buscar.strip().upper()
-            rows = [r for r in rows if q in r.get("symbol", "").upper()]
-
-        rows.sort(key=lambda r: sort_key(r.get("symbol", ""), r.get("category", "")))
-
-        monedas = [r for r in rows if r.get("category") == "DOLAR"]
-        granos = [r for r in rows if r.get("category") == "GRANO"]
-
-        # En Monedas mostramos solo dólares puros: sin pases ya cotizados,
-        # sin DISPO/SPOT y sin mayorista (el filtro de mayorista ya se aplicó arriba),
-        # así quedan únicamente los DLR/MES+AA.
-        monedas_puros = [
-            r for r in monedas
-            if (info := parse_symbol(r.get("symbol", "")))
-            and not info.is_spread
-            and not info.is_dispo
-            and "SPOT" not in r.get("symbol", "").upper()
-        ]
-
-        # DLR/SPOT: precio de referencia A3500 desde pyRofex
-        # Se busca en el snapshot completo (antes de filtrar monedas_puros)
-        _all_rows = mgr.snapshot()
-        dlr_spot_row = next(
-            (r for r in _all_rows if r.get("symbol", "").upper() in ("DLR/SPOT", "DLR/DISPO")),
-            None,
-        )
-
-        # Datos externos (data912): MEP, CCL, acciones, bonos, CEDEARs
-        mep_rows = mgr.get_external("MEP")
-        ccl_rows = mgr.get_external("CCL")
-        acciones = mgr.get_external("ACCIONES")
-        bonos = mgr.get_external("BONOS")
-        cedears = mgr.get_external("CEDEARS")
-
-        with placeholder.container():
-            now_ba = datetime.now(BA_TZ).strftime("%H:%M:%S")
-            st.caption(f"Actualizado: {now_ba} (Buenos Aires) · "
-                       f"Refresco automático cada {refresh_secs}s")
-
-            _render_dolares_financieros(mep_rows, ccl_rows, bonos, dlr_spot_row)
-            st.divider()
-
-            pases_monedas = build_pases(monedas_puros, consecutive_only=True)
-            pases_granos = build_pases(granos, consecutive_only=False)
-
-            (
-                tab_monedas, tab_pmon, tab_granos, tab_pgran,
-                tab_acc, tab_bon, tab_ced, tab_heat, tab_tabla,
-            ) = st.tabs(
-                [
-                    f"💵 Monedas ({len(monedas_puros)})",
-                    f"🔁 Pases monedas ({len(pases_monedas)})",
-                    f"🌾 Granos ({len(granos)})",
-                    f"🔁 Pases agropecuarios ({len(pases_granos)})",
-                    f"🏢 Acciones ({len(acciones)})",
-                    f"🏛️ Bonos ({len(bonos)})",
-                    f"🍎 CEDEARs ({len(cedears)})",
-                    "🗺️ Mapa de Calor BYMA",
-                    "📊 Mi Tabla",
-                ]
-            )
-            with tab_monedas:
-                _render_group("Monedas", "💵", monedas_puros, cols_per_row=cols_per_row)
-            with tab_pmon:
-                _render_pases(pases_monedas, cols_per_row=min(cols_per_row, 3))
-            with tab_granos:
-                _render_group("Granos", "🌾", granos, cols_per_row=cols_per_row)
-            with tab_pgran:
-                _render_pases(pases_granos, cols_per_row=min(cols_per_row, 3))
-            with tab_acc:
-                _render_byma_panel("Acciones BYMA", "🏢", acciones,
-                                   cols_per_row=cols_per_row, buscar=buscar)
-            with tab_bon:
-                _render_byma_panel("Bonos soberanos", "🏛️", bonos,
-                                   cols_per_row=cols_per_row, buscar=buscar)
-            with tab_ced:
-                _render_byma_panel("CEDEARs", "🍎", cedears,
-                                   cols_per_row=cols_per_row, buscar=buscar)
-            with tab_heat:
-                _render_heatmap(acciones)
-            with tab_tabla:
-                st.markdown("### 📊 Mi Tabla")
-                col1, col2 = st.columns(2)
-                with col1:
-                    acc_top = sorted(acciones, key=lambda x: float(x.get("c") or 0)*float(x.get("v") or 0), reverse=True)[:20]
-                    _render_tabla_rava("🏢 Acciones — Top 20 por monto", acc_top)
-                with col2:
-                    bon_top = sorted(bonos, key=lambda x: float(x.get("c") or 0)*float(x.get("v") or 0), reverse=True)[:20]
-                    _render_tabla_rava("🏛️ Bonos soberanos — Top 20", bon_top)
-
-    render()
-
-
-if __name__ == "__main__":
-    main()
+_CAP_MERC: dict
