@@ -454,7 +454,7 @@ def _render_dolares_financieros(
         if r.get("symbol")
     }
 
-    al30  = bonds_by_symbol.get("AL30")
+    al30 = bonds_by_symbol.get("AL30")
     al30c = bonds_by_symbol.get("AL30C")
     al30d = bonds_by_symbol.get("AL30D")
 
@@ -467,7 +467,7 @@ def _render_dolares_financieros(
         except (TypeError, ValueError):
             return None
 
-    p_al30  = _price(al30)
+    p_al30 = _price(al30)
     p_al30c = _price(al30c)
     p_al30d = _price(al30d)
 
@@ -488,7 +488,7 @@ def _render_dolares_financieros(
         except (TypeError, ValueError):
             return None
 
-    pct_al30  = _pct(al30)
+    pct_al30 = _pct(al30)
     pct_al30c = _pct(al30c)
     pct_al30d = _pct(al30d)
 
@@ -510,12 +510,10 @@ def _render_dolares_financieros(
     if mep and ccl and mep > 0:
         brecha_ccl_mep = (ccl / mep - 1) * 100
 
-    # Usamos directamente el spot traído de DolarApi
     spot = spot_from_api
-    spot_pct = 0.0  # DolarApi provee el intradiario neto, seteamos neutro o podés calcular variación si guardás el cierre
+    spot_pct = 0.0
     spot_prev = spot
 
-    # Brecha MEP / A3500
     brecha_mep_spot = None
     if mep and spot and spot > 0:
         brecha_mep_spot = (mep / spot - 1) * 100
@@ -526,7 +524,7 @@ def _render_dolares_financieros(
     )
 
     def _fin_card(label: str, precio: float | None, pct: float | None,
-                  prev: float | None, sub: str) -> str:
+                  prev: float | None, sub: str) -> str:
         price_str = f"${precio:,.2f}" if precio else "—"
         change_text, change_cls = _fmt_change(pct)
         abs_change = _fmt_abs_change(precio, prev)
