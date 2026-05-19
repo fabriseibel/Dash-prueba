@@ -827,9 +827,18 @@ def main() -> None:
 
     mgr = get_manager()
 
+    # --- INICIALIZACIÓN STRICT EN VACÍO (SIN SALVADO FIJO) ---
+    if "cached_spot_value" not in st.session_state:
+        st.session_state.cached_spot_value = None  # Arranca totalmente vacío si no hay API
     if "last_dolarapi_check" not in st.session_state:
-        st.session_state.last_dolarapi_check = 0.0
-        st.session_state.cached_spot_value = 1397.00
+        from symbol_utils import obtener_dolar_mayorista_realtime
+        nuevo_spot = obtener_dolar_mayorista_realtime()
+        # Solo guardamos si la API responde con éxito un número real
+        if nuevo_spot and nuevo_spot > 0:
+            st.session_state.cached_spot_value = nuevo_spot
+        else:
+            st.session_state.cached_spot_value = None
+        st.session_state.last_dolarapi_check = time.time()
 
     with st.sidebar:
         st.header("Estado")
@@ -883,11 +892,11 @@ def main() -> None:
             else:
                 ext_status.append(f"✓ {key}: {n} filas")
         
-        if st.session_state.last_dolarapi_check > 0:
+        if st.session_state.last_dolarapi_check > 0 and st.session_state.cached_spot_value is not None:
             api_time = datetime.fromtimestamp(st.session_state.last_dolarapi_check, BA_TZ).strftime('%H:%M:%S')
             ext_status.append(f"✓ DolarApi: ${st.session_state.cached_spot_value:,.2f} ({api_time})")
         else:
-            ext_status.append("⏳ DolarApi: Esperando consulta...")
+            ext_status.append("❌ DolarApi: Sin datos / API caída")
             
         st.caption("\n".join(ext_status))
 
@@ -922,12 +931,15 @@ def main() -> None:
 
     @st.fragment(run_every=refresh_secs)
     def render():
-        ahora = time.time()
-        if ahora - st.session_state.last_dolarapi_check > 60:
+        # Control de tiempo afuera: si falla la API, pasa inmediatamente a None (vacío)
+        if time.time() - st.session_state.last_dolarapi_check > 60:
+            from symbol_utils import obtener_dolar_mayorista_realtime
             nuevo_spot = obtener_dolar_mayorista_realtime()
             if nuevo_spot and nuevo_spot > 0:
                 st.session_state.cached_spot_value = nuevo_spot
-                st.session_state.last_dolarapi_check = ahora
+            else:
+                st.session_state.cached_spot_value = None  # Borramos todo rastro viejo si no responde
+            st.session_state.last_dolarapi_check = time.time()
 
         rows = mgr.snapshot()
 
@@ -946,80 +958,7 @@ def main() -> None:
 
         if buscar:
             q = buscar.strip().upper()
-            rows = [r for r in rows if q in r.get("symbol", "").upper()]
-
-        rows.sort(key=lambda r: sort_key(r.get("symbol", ""), r.get("category", "")))
-
-        monedas = [r for r in rows if r.get("category") == "DOLAR"]
-        granos = [r for r in rows if r.get("category") == "GRANO"]
-
-        monedas_puros = [
-            r for r in monedas
-            if (info := parse_symbol(r.get("symbol", "")))
-            and not info.is_spread
-            and not info.is_dispo
-            and "SPOT" not in r.get("symbol", "").upper()
-        ]
-
-        mep_rows = mgr.get_external("MEP")
-        ccl_rows = mgr.get_external("CCL")
-        acciones = mgr.get_external("ACCIONES")
-        bonos = mgr.get_external("BONOS")
-        cedears = mgr.get_external("CEDEARS")
-
-        with placeholder.container():
-            now_ba = datetime.now(BA_TZ).strftime("%H:%M:%S")
-            st.caption(f"Actualizado: {now_ba} (Buenos Aires) · Refresco automático cada {refresh_secs}s")
-
-            _render_dolares_financieros(mep_rows, ccl_rows, bonos, st.session_state.cached_spot_value)
-            st.divider()
-
-            pases_monedas = build_pases(monedas_puros, consecutive_only=True)
-            pases_granos = build_pases(granos, consecutive_only=False)
-
-            (
-                tab_monedas, tab_pmon, tab_granos, tab_pgran,
-                tab_acc, tab_bon, tab_ced, tab_heat, tab_tabla,
-            ) = st.tabs(
-                [
-                    f"💵 Monedas ({len(monedas_puros)})",
-                    f"🔁 Pases monedas ({len(pases_monedas)})",
-                    f"🌾 Granos ({len(granos)})",
-                    f"🔁 Pases agropecuarios ({len(pases_granos)})",
-                    f"🏢 Acciones ({len(acciones)})",
-                    f"🏛️ Bonos ({len(bonos)})",
-                    f"🍎 CEDEARs ({len(cedears)})",
-                    "🗺️ Mapa de Calor BYMA",
-                    "📊 Mi Tabla",
-                ]
-            )
-            with tab_monedas:
-                _render_group("Monedas", "💵", monedas_puros, cols_per_row=cols_per_row)
-            with tab_pmon:
-                _render_pases(pases_monedas, cols_per_row=min(cols_per_row, 3))
-            with tab_granos:
-                _render_group("Granos", "🌾", granos, cols_per_row=cols_per_row)
-            with tab_pgran:
-                _render_pases(pases_granos, cols_per_row=min(cols_per_row, 3))
-            with tab_acc:
-                _render_byma_panel("Acciones BYMA", "🏢", acciones, cols_per_row=cols_per_row, buscar=buscar)
-            with tab_bon:
-                _render_byma_panel("Bonos soberanos", "🏛️", bonos, cols_per_row=cols_per_row, buscar=buscar)
-            with tab_ced:
-                _render_byma_panel("CEDEARs", "🍎", cedears, cols_per_row=cols_per_row, buscar=buscar)
-            with tab_heat:
-                _render_heatmap(acciones)
-            with tab_tabla:
-                st.markdown("### 📊 Mi Tabla")
-                col1, col2 = st.columns(2)
-                with col1:
-                    acc_top = sorted(acciones, key=lambda x: float(x.get("c") or 0)*float(x.get("v") or 0), reverse=True)[:20]
-                    _render_tabla_rava("🏢 Acciones — Top 20 por monto", acc_top)
-                with col2:
-                    bon_top = sorted(bonos, key=lambda x: float(x.get("c") or 0)*float(x.get("v") or 0), reverse=True)[:20]
-                    _render_tabla_rava("🏛️ Bonos soberanos — Top 20", bon_top)
-
-    render()
+            rows =
 
 
 if __name__ == "__main__":
