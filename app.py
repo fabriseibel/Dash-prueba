@@ -1,6 +1,6 @@
 """Dashboard Streamlit: precios en tiempo real de dólares y granos
 desde Matba Rofex (pyRofex WebSocket) con persistencia en Supabase."""
-from __future__ import annotations
+from __future annotations
 
 import time
 from calendar import monthrange
@@ -887,11 +887,12 @@ def main() -> None:
             else:
                 ext_status.append(f"✓ {key}: {n} filas")
         
-        spot_api = obtener_spot_api_cached()
-        if spot_api:
-            ext_status.append(f"✓ DolarApi: ${spot_api:,.2f} (Cached 60s)")
+        # Indicador inteligente de procedencia del SPOT en la barra lateral
+        spot_check = obtener_spot_api_cached()
+        if spot_check:
+            ext_status.append(f"✓ DolarApi: ${spot_check:,.2f} (Cached 60s)")
         else:
-            ext_status.append("❌ DolarApi: Sin datos / API caída")
+            ext_status.append("⚠️ DolarApi: Sin respuesta. Usando SPOT Matba Rofex")
             
         st.caption("\n".join(ext_status))
 
@@ -926,9 +927,22 @@ def main() -> None:
 
     @st.fragment(run_every=refresh_secs)
     def render():
+        # 1. Intentamos leer el valor de la caché de DolarApi
         spot_value = obtener_spot_api_cached()
         
+        # 2. Levantamos el snapshot de Matba Rofex
         rows = mgr.snapshot()
+
+        # 3. PLAN DE CONTINGENCIA: Si DolarApi no responde, usamos el SPOT de Rofex para que no quede vacío
+        if spot_value is None:
+            dlr_spot_row = next(
+                (r for r in rows if r.get("symbol", "").upper() in ("DLR/SPOT", "DLR/DISPO")),
+                None,
+            )
+            if dlr_spot_row:
+                spot_value = (dlr_spot_row.get("last_price") or dlr_spot_row.get("offer") or
+                              dlr_spot_row.get("bid") or dlr_spot_row.get("prev_close") or
+                              dlr_spot_row.get("closing_price"))
 
         if underlying_filter:
             rows = [r for r in rows if r.get("underlying") in underlying_filter]
