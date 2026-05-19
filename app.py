@@ -514,11 +514,15 @@ def _render_dolares_financieros(
     spot_pct = None
     spot_prev = None
     if dlr_spot_row:
-        spot = dlr_spot_row.get("last_price") or dlr_spot_row.get("offer") or dlr_spot_row.get("bid")
-        spot_pct = dlr_spot_row.get("change_pct")
-        spot_prev = dlr_spot_row.get("prev_close")
-        if spot is None and spot_prev and spot_pct is not None:
-            spot = spot_prev * (1 + spot_pct / 100)
+        spot = (dlr_spot_row.get("last_price") or dlr_spot_row.get("offer") or
+                dlr_spot_row.get("bid") or dlr_spot_row.get("prev_close") or
+                dlr_spot_row.get("closing_price"))
+        spot_prev = dlr_spot_row.get("prev_close") or dlr_spot_row.get("closing_price")
+        if spot and spot_prev:
+            try: spot_pct = (spot - spot_prev) / spot_prev * 100
+            except: spot_pct = dlr_spot_row.get("change_pct")
+        else:
+            spot_pct = dlr_spot_row.get("change_pct")
 
     # Brecha MEP / A3500
     brecha_mep_spot = None
@@ -849,6 +853,55 @@ def _render_group(title: str, emoji: str, rows: list[dict], cols_per_row: int = 
                 st.empty()
 
 
+
+TABLE_CSS_RAVA = """
+<style>
+.rava-wrap{background:#0f1117;border-radius:12px;padding:16px;margin-bottom:20px}
+.rava-title{font-size:.85rem;font-weight:700;color:#9ca3af;text-transform:uppercase;
+    letter-spacing:.06em;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid #1f2937}
+.rava-table{width:100%;border-collapse:collapse;font-size:.83rem}
+.rava-table th{color:#6b7280;font-weight:600;font-size:.72rem;text-transform:uppercase;
+    letter-spacing:.05em;padding:6px 10px;text-align:right;border-bottom:1px solid #1f2937}
+.rava-table th:first-child{text-align:left}
+.rava-table td{padding:7px 10px;text-align:right;color:#d1d5db;border-bottom:1px solid #1a1f2e;font-weight:500}
+.rava-table td:first-child{text-align:left;color:#f9fafb;font-weight:700}
+.rava-table tr:last-child td{border-bottom:none}
+.rava-table tr:hover td{background:#1a1f2e}
+.rv-pos{color:#22c55e!important;font-weight:700!important}
+.rv-neg{color:#ef4444!important;font-weight:700!important}
+.rv-neu{color:#6b7280!important}
+</style>
+"""
+
+def _render_tabla_rava(titulo, items, symbol_field="symbol", price_field="c",
+                       pct_field="pct_change", vol_field="v", prev_field="close"):
+    def _p(v):
+        if v is None: return '<span class="rv-neu">—</span>'
+        try: return f"{float(v):,.2f}"
+        except: return "—"
+    def _pct(v):
+        if v is None: return '<span class="rv-neu">—</span>'
+        try:
+            f = float(v)
+            cls = "rv-pos" if f>0 else ("rv-neg" if f<0 else "rv-neu")
+            return f'<span class="{cls}>{"+" if f>0 else ""}{f:.2f}%</span>'
+        except: return "—"
+    def _vol(v):
+        if v is None: return '<span class="rv-neu">—</span>'
+        try:
+            vi = int(float(v))
+            if vi>=1_000_000: return f"{vi/1_000_000:.1f}M"
+            if vi>=1_000: return f"{vi/1_000:.0f}K"
+            return str(vi)
+        except: return "—"
+    rows_html = ""
+    for it in items:
+        sym = it.get(symbol_field) or it.get("ticker") or "—"
+        rows_html += f"<tr><td>{sym}</td><td>{_p(it.get(price_field) or it.get('mark'))}</td><td>{_pct(it.get(pct_field))}</td><td>{_vol(it.get(vol_field))}</td><td>{_p(it.get(prev_field))}</td></tr>"
+    if not rows_html:
+        rows_html = '<tr><td colspan="5" style="color:#6b7280;text-align:center;padding:12px;">Sin datos</td></tr>'
+    st.markdown(f"""{TABLE_CSS_RAVA}<div class="rava-wrap"><div class="rava-title">{titulo}</div><table class="rava-table"><thead><tr><th>Especie</th><th>Último</th><th>% Día</th><th>Volumen</th><th>Cierre ant.</th></tr></thead><tbody>{rows_html}</tbody></table></div>""", unsafe_allow_html=True)
+
 def main() -> None:
     st.markdown(CARD_CSS, unsafe_allow_html=True)
     st.title("Matba Rofex — Dashboard en tiempo real")
@@ -1002,7 +1055,7 @@ def main() -> None:
 
             (
                 tab_monedas, tab_pmon, tab_granos, tab_pgran,
-                tab_acc, tab_bon, tab_ced, tab_heat,
+                tab_acc, tab_bon, tab_ced, tab_heat, tab_tabla,
             ) = st.tabs(
                 [
                     f"💵 Monedas ({len(monedas_puros)})",
@@ -1013,6 +1066,7 @@ def main() -> None:
                     f"🏛️ Bonos ({len(bonos)})",
                     f"🍎 CEDEARs ({len(cedears)})",
                     "🗺️ Mapa de Calor BYMA",
+                    "📊 Mi Tabla",
                 ]
             )
             with tab_monedas:
@@ -1034,6 +1088,15 @@ def main() -> None:
                                    cols_per_row=cols_per_row, buscar=buscar)
             with tab_heat:
                 _render_heatmap(acciones)
+            with tab_tabla:
+                st.markdown("### 📊 Mi Tabla")
+                col1, col2 = st.columns(2)
+                with col1:
+                    acc_top = sorted(acciones, key=lambda x: float(x.get("c") or 0)*float(x.get("v") or 0), reverse=True)[:20]
+                    _render_tabla_rava("🏢 Acciones — Top 20 por monto", acc_top)
+                with col2:
+                    bon_top = sorted(bonos, key=lambda x: float(x.get("c") or 0)*float(x.get("v") or 0), reverse=True)[:20]
+                    _render_tabla_rava("🏛️ Bonos soberanos — Top 20", bon_top)
 
     render()
 
