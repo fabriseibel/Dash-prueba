@@ -141,3 +141,15 @@ def sort_key(symbol: str, category: str) -> tuple:
 
     spread_key = 1 if info.is_spread else 0
     return (fam_order, date_key, spread_key, symbol)
+    import requests
+
+def obtener_dolar_mayorista_realtime():
+    url = "https://dolarapi.com/v1/dolares/mayorista"
+    try:
+        response = requests.get(url, timeout=3)
+        if response.status_code == 200:
+            data = response.json()
+            return float(data.get("venta", 0))
+    except Exception as e:
+        print(f"Error DolarApi: {e}")
+    return 0
