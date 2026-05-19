@@ -187,6 +187,15 @@ def get_manager() -> RofexManager:
     return mgr
 
 
+# --- FUNCIÓN CON CACHÉ DE TIEMPO INTELIGENTE (EVITA CONGELAMIENTO) ---
+@st.cache_data(ttl=60, show_spinner=False)
+def obtener_spot_api_cached() -> float | None:
+    val = obtener_dolar_mayorista_realtime()
+    if val and val > 0:
+        return val
+    return None
+
+
 def _fmt_price(v) -> str:
     if v is None or pd.isna(v):
         return "—"
@@ -378,4 +387,404 @@ def _render_pases(pases: list[dict], cols_per_row: int = 3) -> None:
     for family_name, items in by_family.items():
         st.markdown(f"**{family_name}**")
         for start in range(0, len(items), cols_per_row):
-            chunk = items
+            chunk = items[start:start + cols_per_row]
+            cols = st.columns(cols_per_row)
+            for col, p in zip(cols, chunk):
+                with col:
+                    st.markdown(_render_pase_card(p), unsafe_allow_html=True)
+
+
+def _weighted_avg(items: list[dict], price_key: str, weight_key: str) -> float | None:
+    num = 0.0
+    den = 0.0
+    for it in items:
+        p = it.get(price_key)
+        w = it.get(weight_key)
+        if p is None or w is None:
+            continue
+        try:
+            p = float(p)
+            w = float(w)
+        except (TypeError, ValueError):
+            continue
+        if w <= 0 or p <= 0:
+            continue
+        num += p * w
+        den += w
+    if den == 0:
+        return None
+    return num / den
+
+
+def _render_dolares_financieros(
+    mep_rows: list[dict],
+    ccl_rows: list[dict],
+    bonos_rows: list[dict],
+    spot_from_api: float | None = None,
+) -> None:
+    bonds_by_symbol = {
+        str(r.get("symbol", "")).upper(): r
+        for r in bonos_rows
+        if r.get("symbol")
+    }
+
+    al30 = bonds_by_symbol.get("AL30")
+    al30c = bonds_by_symbol.get("AL30C")
+    al30d = bonds_by_symbol.get("AL30D")
+
+    def _price(r: dict | None) -> float | None:
+        if r is None:
+            return None
+        v = r.get("c") or r.get("mark") or r.get("px_bid")
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    p_al30 = _price(al30)
+    p_al30c = _price(al30c)
+    p_al30d = _price(al30d)
+
+    mep = None
+    if p_al30 and p_al30d and p_al30d > 0:
+        mep = p_al30 / p_al30d
+
+    ccl = None
+    if p_al30 and p_al30c and p_al30c > 0:
+        ccl = p_al30 / p_al30c
+
+    def _pct(r: dict | None) -> float | None:
+        if r is None:
+            return None
+        v = r.get("pct_change")
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    pct_al30 = _pct(al30)
+    pct_al30c = _pct(al30c)
+    pct_al30d = _pct(al30d)
+
+    mep_pct = (pct_al30 - pct_al30d) if (pct_al30 is not None and pct_al30d is not None) else None
+    ccl_pct = (pct_al30 - pct_al30c) if (pct_al30 is not None and pct_al30c is not None) else None
+
+    def _prev(precio: float | None, pct: float | None) -> float | None:
+        if precio is None or pct is None:
+            return None
+        try:
+            return precio / (1 + pct / 100)
+        except ZeroDivisionError:
+            return None
+
+    mep_prev = _prev(mep, mep_pct)
+    ccl_prev = _prev(ccl, ccl_pct)
+
+    brecha_ccl_mep = None
+    if mep and ccl and mep > 0:
+        brecha_ccl_mep = (ccl / mep - 1) * 100
+
+    spot = spot_from_api
+    spot_pct = 0.0
+    spot_prev = spot
+
+    brecha_mep_spot = None
+    if mep and spot and spot > 0:
+        brecha_mep_spot = (mep / spot - 1) * 100
+
+    st.markdown('<div class="section-title">📊 Dólares financieros</div>', unsafe_allow_html=True)
+
+    def _fin_card(label: str, precio: float | None, pct: float | None, prev: float | None, sub: str) -> str:
+        price_str = f"${precio:,.2f}" if precio else "—"
+        change_text, change_cls = _fmt_change(pct)
+        abs_change = _fmt_abs_change(precio, prev)
+        abs_html = f'<span class="abs-change {change_cls}">({abs_change})</span>' if abs_change else ""
+        return f"""
+        <div class="metric-card {change_cls}">
+            <div class="symbol">{label}</div>
+            <div class="price">{price_str}</div>
+            <div class="change {change_cls}">{change_text} {abs_html}</div>
+            <div class="footer"><span><span class="label">{sub}</span></span></div>
+        </div>
+        """
+
+    def _brecha_card(label: str, brecha: float | None, sub: str) -> str:
+        if brecha is None:
+            cls, val = "neutral", "—"
+        else:
+            cls = "positive" if brecha >= 0 else "negative"
+            val = f"{'+' if brecha >= 0 else ''}{brecha:.2f}%"
+        return f"""
+        <div class="metric-card {cls}" style="padding:10px 14px; margin-bottom:7px;">
+            <div class="symbol" style="margin-bottom:3px;">{label}</div>
+            <div class="price" style="font-size:1.25rem;">{val}</div>
+            <div style="font-size:0.72rem; color:#9ca3af; margin-top:4px;">{sub}</div>
+        </div>
+        """
+
+    col_mep, col_spot, col_ccl, col_brechas = st.columns(4)
+
+    with col_mep:
+        sub_mep = f"AL30 ÷ AL30D · {p_al30:.2f} ÷ {p_al30d:.2f}" if (p_al30 and p_al30d) else "AL30 ÷ AL30D · sin datos"
+        st.markdown(_fin_card("Dólar MEP", mep, mep_pct, mep_prev, sub_mep), unsafe_allow_html=True)
+
+    with col_spot:
+        sub_spot = "Mayorista · DolarApi tiempo real" if spot else "DolarApi · sin datos"
+        st.markdown(_fin_card("Dólar A3500", spot, spot_pct, spot_prev, sub_spot), unsafe_allow_html=True)
+
+    with col_ccl:
+        sub_ccl = f"AL30 ÷ AL30C · {p_al30:.2f} ÷ {p_al30c:.2f}" if (p_al30 and p_al30c) else "AL30 ÷ AL30C · sin datos"
+        st.markdown(_fin_card("Dólar CCL", ccl, ccl_pct, ccl_prev, sub_ccl), unsafe_allow_html=True)
+
+    with col_brechas:
+        st.markdown(
+            _brecha_card("Brecha CCL / MEP", brecha_ccl_mep, "(CCL ÷ MEP) − 1") +
+            _brecha_card("Brecha MEP / A3500", brecha_mep_spot, "(MEP ÷ A3500) − 1"),
+            unsafe_allow_html=True,
+        )
+
+
+def _render_byma_card(item: dict) -> str:
+    symbol = item.get("ticker") or item.get("ticker_ar") or item.get("symbol") or "—"
+    last = item.get("c") or item.get("mark")
+    pct = item.get("pct_change")
+    vol = item.get("v")
+    prev_close = item.get("close")
+
+    if pct is None and last and prev_close:
+        try:
+            pct = (float(last) - float(prev_close)) / float(prev_close) * 100
+        except (TypeError, ValueError, ZeroDivisionError):
+            pct = None
+
+    pct_text, pct_cls = _fmt_change(pct)
+    abs_change = _fmt_abs_change(last, prev_close)
+    abs_html = f'<span class="abs-change {pct_cls}">({abs_change})</span>' if abs_change else ""
+    card_cls = pct_cls
+
+    return f"""
+    <div class="metric-card {card_cls}">
+        <div class="symbol" title="{symbol}">{symbol}</div>
+        <div class="price">{_fmt_price(last)}</div>
+        <div class="change {pct_cls}">{pct_text} {abs_html}</div>
+        <div class="footer">
+            <span><span class="label">Vol.</span> <span class="value">{_fmt_int(vol)}</span></span>
+            <span><span class="label">Cierre prev.</span> <span class="value">{_fmt_price(prev_close)}</span></span>
+        </div>
+    </div>
+    """
+
+
+_CAP_MERC: dict[str, float] = {
+    "YPFD": 25270, "GGAL": 10380, "TECO2": 7290, "BMA": 7090, "TGSU2": 6810,
+    "PAMP": 6500, "BBAR": 4410, "CEPU": 3270, "TXAR": 3150, "ALUA": 2780,
+    "BYMA": 2380, "TGNO4": 1870, "LOMA": 1820, "IRSA": 1740, "TRAN": 1700,
+    "EDN": 1670, "BPAT": 1460, "CVH": 1320, "MOLA": 1200, "CRES": 1180,
+    "SUPV": 1170, "METR": 1090, "CAPX": 770.45, "VALO": 768.02, "CTIO": 756.28,
+    "CGPA2": 719.89, "A3": 716.30, "ECOG": 664.77, "GBAN": 659.22, "HARG": 634.56,
+    "PATA": 615, "MOLI": 542, "BHIP": 512.21, "GCLA": 408.42, "LEDE": 342.54,
+    "MIRG": 338.38, "COME": 334.81, "DGCU2": 331.86, "CECO2": 322.91,
+    "AUSO": 318.18, "INVJ": 317.09, "DGCE": 315.3, "HAVA": 277.16,
+    "RICH": 130.41, "GRIM": 122.95, "OEST": 120.48, "BOLT": 109.42,
+    "FERR": 98.11, "GAMI": 92.65, "SAMI": 81.98, "RIGO": 69.49,
+    "CADO": 67.88, "SEMI": 66.42, "AGRO": 54.84, "IEB": 47.6,
+    "INTR": 38.02, "FIPL": 33.6, "CELU": 27.86, "CARC": 25.65,
+    "GCDI": 14.51, "GARO": 11.59, "LONG": 9.82, "MORI": 8.34,
+    "ROSE": 6.94, "POLL": 1.7,
+}
+
+_SECTORES: dict[str, str] = {
+    "YPFD": "Energía", "PAMP": "Energía", "TGSU2": "Energía",
+    "TGNO4": "Energía", "CEPU": "Energía", "TRAN": "Energía",
+    "EDN": "Energía", "CAPX": "Energía", "DGCU2": "Energía",
+    "CECO2": "Energía", "HARG": "Energía", "CGPA2": "Energía",
+    "ROSE": "Energía",
+    "GGAL": "Financiero", "BMA": "Financiero", "BBAR": "Financiero",
+    "SUPV": "Financiero", "VALO": "Financiero", "BYMA": "Financiero",
+    "BHIP": "Financiero", "GCLA": "Financiero", "BPAT": "Financiero",
+    "GBAN": "Financiero", "INVJ": "Financiero", "IEB": "Financiero",
+    "INTR": "Financiero",
+    "TECO2": "Telecom", "CVH": "Telecom", "CTIO": "Telecom",
+    "ALUA": "Materiales", "LOMA": "Materiales", "TXAR": "Materiales",
+    "BOLT": "Materiales", "FERR": "Materiales", "GARO": "Materiales",
+    "CARC": "Materiales",
+    "IRSA": "Real Estate", "MOLA": "Real Estate", "CRES": "Real Estate",
+    "GCDI": "Real Estate", "LONG": "Real Estate",
+    "MOLI": "Consumo", "LEDE": "Consumo", "COME": "Consumo",
+    "RICH": "Consumo", "GRIM": "Consumo", "PATA": "Consumo",
+    "AGRO": "Consumo", "CADO": "Consumo", "POLL": "Consumo",
+    "SAMI": "Consumo", "RIGO": "Consumo", "MORI": "Consumo",
+    "AUSO": "Industrial", "MIRG": "Industrial", "FIPL": "Industrial",
+    "GAMI": "Industrial",
+    "METR": "Utilities", "ECOG": "Utilities", "OEST": "Utilities",
+    "DGCE": "Utilities", "A3": "Utilities",
+    "HAVA": "Salud", "CELU": "Salud",
+    "SEMI": "Tecnología",
+}
+
+
+def _render_heatmap(acciones: list[dict]) -> None:
+    import plotly.graph_objects as go
+
+    rows = {
+        str(r.get("symbol", "") or r.get("ticker", "")).upper(): r
+        for r in acciones
+        if (r.get("symbol") or r.get("ticker")) and r.get("c")
+    }
+
+    ids, labels, parents, values, colors, custom = [], [], [], [], [], []
+
+    sectores_cap: dict[str, float] = {}
+    for ticker, cap in _CAP_MERC.items():
+        if ticker not in rows:
+            continue
+        sector = _SECTORES.get(ticker, "Otros")
+        sectores_cap[sector] = sectores_cap.get(sector, 0) + cap
+
+    for sector, total_cap in sectores_cap.items():
+        ids.append(sector)
+        labels.append(f"<b>{sector}</b>")
+        parents.append("")
+        values.append(total_cap)
+        colors.append(0.0)
+        custom.append(f"<b>{sector}</b>")
+
+    for ticker, cap in _CAP_MERC.items():
+        r = rows.get(ticker)
+        if r is None:
+            continue
+        sector = _SECTORES.get(ticker, "Otros")
+        precio = float(r.get("c") or 0)
+        pct = float(r.get("pct_change") or 0)
+        vol = int(r.get("v") or 0)
+        ids.append(ticker)
+        labels.append(f"{ticker}<br>{'+' if pct>=0 else ''}{pct:.2f}%")
+        parents.append(sector)
+        values.append(cap)
+        colors.append(pct)
+        custom.append(
+            f"<b>{ticker}</b><br>"
+            f"Precio: ${precio:,.2f}<br>"
+            f"Var: {'+' if pct>=0 else ''}{pct:.2f}%<br>"
+            f"Cap. Merc.: ${cap:,.0f}M<br>"
+            f"Vol: {vol:,}"
+        )
+
+    if not ids:
+        st.info("Sin datos de acciones todavía.")
+        return
+
+    max_abs = max((abs(c) for c in colors if c != 0.0), default=3)
+    max_abs = max(max_abs, 1)
+
+    colorscale = [
+        [0.0,  "#9A0000"],
+        [0.2,  "#CC0000"],
+        [0.38, "#880000"],
+        [0.48, "#222222"],
+        [0.5,  "#1a1a1a"],
+        [0.52, "#003300"],
+        [0.62, "#007700"],
+        [0.8,  "#00AA00"],
+        [1.0,  "#00CC00"],
+    ]
+
+    fig = go.Figure(go.Treemap(
+        ids=ids,
+        labels=labels,
+        parents=parents,
+        values=values,
+        branchvalues="total",
+        marker=dict(
+            colors=colors,
+            colorscale=colorscale,
+            cmin=-max_abs,
+            cmid=0,
+            cmax=max_abs,
+            showscale=False,
+            line=dict(width=1, color="#000000"),
+        ),
+        customdata=custom,
+        hovertemplate="%{customdata}<extra></extra>",
+        textfont=dict(
+            size=13,
+            color="white",
+            family="Arial Black, Arial, sans-serif",
+        ),
+        textposition="middle center",
+        pathbar=dict(visible=False),
+        tiling=dict(packing="squarify", pad=2),
+    ))
+
+    fig.update_layout(
+        margin=dict(t=0, l=0, r=0, b=0),
+        height=680,
+        paper_bgcolor="#000000",
+        plot_bgcolor="#000000",
+        font=dict(color="white"),
+    )
+
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+
+def _render_byma_panel(title: str, emoji: str, items: list[dict],
+                       cols_per_row: int = 4, top_n: int = 60,
+                       buscar: str = "") -> None:
+    if buscar:
+        q = buscar.strip().upper()
+        items = [
+            it for it in items
+            if q in str(it.get("ticker") or it.get("ticker_ar") or it.get("symbol") or "").upper()
+        ]
+
+    def _monto(it: dict) -> float:
+        price = it.get("c") or it.get("mark") or it.get("close") or 0
+        vol = it.get("v") or it.get("v_ars") or 0
+        try:
+            return float(price) * float(vol)
+        except (TypeError, ValueError):
+            return 0.0
+
+    items_sorted = sorted(items, key=_monto, reverse=True)
+    items_view = items_sorted[:top_n]
+
+    st.markdown(f'<div class="section-title">{emoji} {title} <span class="badge">{len(items_view)} / {len(items)}</span></div>', unsafe_allow_html=True)
+
+    if not items_view:
+        st.markdown('<div class="empty-card">Sin datos todavía. Esperando respuesta de data912…</div>', unsafe_allow_html=True)
+        return
+
+    for start in range(0, len(items_view), cols_per_row):
+        chunk = items_view[start:start + cols_per_row]
+        cols = st.columns(cols_per_row)
+        for col, it in zip(cols, chunk):
+            with col:
+                st.markdown(_render_byma_card(it), unsafe_allow_html=True)
+
+
+def _render_group(title: str, emoji: str, rows: list[dict], cols_per_row: int = 4) -> None:
+    st.markdown(f'<div class="section-title">{emoji} {title} <span class="badge">{len(rows)}</span></div>', unsafe_allow_html=True)
+
+    if not rows:
+        st.markdown('<div class="empty-card">Sin datos para mostrar todavía. Esperando primeros ticks del mercado…</div>', unsafe_allow_html=True)
+        return
+
+    for start in range(0, len(rows), cols_per_row):
+        chunk = rows[start:start + cols_per_row]
+        cols = st.columns(cols_per_row)
+        for col, row in zip(cols, chunk):
+            with col:
+                st.markdown(_render_card(row), unsafe_allow_html=True)
+        for col in cols[len(chunk):]:
+            with col:
+                st.empty()
+
+
+TABLE_CSS_RAVA = """
+<style>
+.rava-wrap{background:#0f1117;border-radius:12px;padding:16px;margin-bottom:20px}
+.rava-title{font-size:.85rem;font-weight:700;color:#9ca3af;text-transform:uppercase;
+    letter-spacing:.06em;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid #1f2937}
+.rava-table{width:100%;border-collapse:collapse;font-size:.83rem}
+.rava-table th{color:#6b7280;font-weight:600;font-size:.72rem;text-transform:uppercase;
+    letter-spacing:.05em;padding:6px 10px;text-align:right;
