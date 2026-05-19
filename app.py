@@ -933,12 +933,20 @@ def main() -> None:
         # 2. Levantamos el snapshot de Matba Rofex
         rows = mgr.snapshot()
 
-        # 3. PLAN DE CONTINGENCIA: Si DolarApi no responde, usamos el SPOT de Rofex para que no quede vacío
-        if spot_value is None:
+        # 3. FILTRO INTELIGENTE: Si DolarApi viene retrasado (<= 1397), usamos el intradiario real de Rofex
+        if spot_value is None or spot_value <= 1397.00:
+            # Buscamos la posición más corta o el SPOT directo cotizando en Rofex
             dlr_spot_row = next(
                 (r for r in rows if r.get("symbol", "").upper() in ("DLR/SPOT", "DLR/DISPO")),
                 None,
             )
+            # Si no encuentra el SPOT específico, tomamos el valor de la punta del mes más cercano operado
+            if not dlr_spot_row:
+                dlr_spot_row = next(
+                    (r for r in rows if "DLR/" in r.get("symbol", "").upper() and not parse_symbol(r.get("symbol", "")).is_spread),
+                    None,
+                )
+            
             if dlr_spot_row:
                 spot_value = (dlr_spot_row.get("last_price") or dlr_spot_row.get("offer") or
                               dlr_spot_row.get("bid") or dlr_spot_row.get("prev_close") or
