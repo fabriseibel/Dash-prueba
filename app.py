@@ -573,7 +573,6 @@ def _render_dolares_financieros(
     mep_prev, ccl_prev = _prev(mep, mep_pct), _prev(ccl, ccl_pct)
     brecha_ccl_mep = (ccl / mep - 1) * 100 if mep and ccl and mep > 0 else None
 
-    # Asignación del Spot sin formato roto
     spot = spot_from_api
     spot_pct = 0.0
     spot_prev = spot
@@ -589,18 +588,17 @@ def _render_dolares_financieros(
 
     st.markdown('<div class="section-title">📊 Dólares financieros</div>', unsafe_allow_html=True)
 
-    # Validamos las variables para evitar romper la interpolación f-string
-    val_al30 = f"{p_al30:.2f}" if p_al30 else "0.00"
-    val_al30d = f"{p_al30d:.2f}" if p_al30d else "0.00"
-    val_al30c = f"{p_al30c:.2f}" if p_al30c else "0.00"
+    # CORRECCIÓN DE SINTAXIS: Formateamos afuera para no romper las llaves dinámicas de Streamlit
+    sub_mep_txt = f"AL30 ÷ AL30D · {p_al30:.2f} ÷ {p_al30d:.2f}" if (p_al30 and p_al30d) else "AL30 ÷ AL30D · sin datos"
+    sub_ccl_txt = f"AL30 ÷ AL30C · {p_al30:.2f} ÷ {p_al30c:.2f}" if (p_al30 and p_al30c) else "AL30 ÷ AL30C · sin datos"
 
     col_mep, col_spot, col_ccl, col_brechas = st.columns(4)
     with col_mep:
-        st.markdown(_fin_card("Dólar MEP", mep, mep_pct, mep_prev, f"AL30 ÷ AL30D · {val_al30} ÷ {val_al30d}"), unsafe_allow_html=True)
+        st.markdown(_fin_card("Dólar MEP", mep, mep_pct, mep_prev, sub_mep_txt), unsafe_allow_html=True)
     with col_spot:
         st.markdown(_fin_card("Dólar A3500", spot, spot_pct, spot_prev, "Mayorista · Exacto Real-Time" if spot_from_api else "DLR/SPOT · Fallback Rofex"), unsafe_allow_html=True)
     with col_ccl:
-        st.markdown(_fin_card("Dólar CCL", ccl, ccl_pct, ccl_prev, f"AL30 ÷ AL30C · {val_al30} ÷ {val_al30c}"), unsafe_allow_html=True)
+        st.markdown(_fin_card("Dólar CCL", ccl, ccl_pct, ccl_prev, sub_ccl_txt), unsafe_allow_html=True)
     with col_brechas:
         st.markdown(_brecha_card("Brecha CCL / MEP", brecha_ccl_mep, "(CCL ÷ MEP) − 1") + _brecha_card("Brecha MEP / A3500", brecha_mep_spot, "(MEP ÷ A3500) − 1"), unsafe_allow_html=True)
 
