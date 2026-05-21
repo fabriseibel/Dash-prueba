@@ -510,7 +510,7 @@ def _render_dolares_financieros(
     if mep and ccl and mep > 0:
         brecha_ccl_mep = (ccl / mep - 1) * 100
 
- spot = spot_pct = spot_prev = None
+        spot = spot_pct = spot_prev = None
     if mayorista_data:
         spot = mayorista_data.get("venta") or mayorista_data.get("compra")
     elif dlr_spot_row:
