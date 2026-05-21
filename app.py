@@ -252,6 +252,38 @@ def _fmt_abs_change(last, prev) -> str:
     return f"{sign}{diff:,.2f}"
 
 
+# --- COMPONENTE VISUAL 1: DEFINICIÓN DE TARJETAS FINANCIERAS ---
+def _fin_card(label: str, precio: float | None, pct: float | None, prev: float | None, sub: str) -> str:
+    price_str = f"${precio:,.2f}" if precio else "—"
+    change_text, change_cls = _fmt_change(pct)
+    abs_change = _fmt_abs_change(precio, prev)
+    abs_html = f'<span class="abs-change {change_cls}">({abs_change})</span>' if abs_change else ""
+    return f"""
+    <div class="metric-card {change_cls}">
+        <div class="symbol">{label}</div>
+        <div class="price">{price_str}</div>
+        <div class="change {change_cls}">{change_text} {abs_html}</div>
+        <div class="footer"><span><span class="label">{sub}</span></span></div>
+    </div>
+    """
+
+
+# --- COMPONENTE VISUAL 2: DEFINICIÓN DE BRECHAS ---
+def _brecha_card(label: str, brecha: float | None, sub: str) -> str:
+    if brecha is None:
+        cls, val = "neutral", "—"
+    else:
+        cls = "positive" if brecha >= 0 else "negative"
+        val = f"{'+' if brecha >= 0 else ''}{brecha:.2f}%"
+    return f"""
+    <div class="metric-card {cls}" style="padding:10px 14px; margin-bottom:7px;">
+        <div class="symbol" style="margin-bottom:3px;">{label}</div>
+        <div class="price" style="font-size:1.25rem;">{val}</div>
+        <div style="font-size:0.72rem; color:#9ca3af; margin-top:4px;">{sub}</div>
+    </div>
+    """
+
+
 def _render_card(row: dict) -> str:
     symbol = display_symbol(row.get("symbol", "—"))
     last = row.get("last_price")
@@ -412,50 +444,6 @@ def _build_pases_disponible(granos: list[dict], precios_dispo: dict) -> list[dic
     return pases
 
 
-def _render_pase_card(p: dict) -> str:
-    spread = p["spread"]
-    spread_cls = "positive" if spread > 0 else ("negative" if spread < 0 else "")
-    spread_sign = "+" if spread >= 0 else ""
-    directo = p.get("directo", 0.0)
-    directo_sign = "+" if directo >= 0 else ""
-
-    tna = p.get("tna")
-    if tna is None:
-        tna_str = "—"
-        tna_cls = ""
-    else:
-        tna_cls = "positive" if tna > 0 else ("negative" if tna < 0 else "")
-        tna_sign = "+" if tna >= 0 else ""
-        tna_str = f"{tna_sign}{tna:.2f}%"
-
-    return f"""
-    <div class="pase-card">
-        <div class="pair">
-            {p['short_label']} <span class="arrow">→</span> {p['family_name']} {p['long_label']}
-        </div>
-        <div class="legs">
-            <span class="num">{_fmt_price(p['p_short'])}</span> &nbsp;·&nbsp;
-            <span class="num">{_fmt_price(p['p_long'])}</span> &nbsp;·&nbsp;
-            {p['days']} días
-        </div>
-        <div class="metrics">
-            <div class="metric">
-                <span class="label">Diferencia</span>
-                <span class="value {spread_cls}">{spread_sign}{spread:,.2f}</span>
-            </div>
-            <div class="metric">
-                <span class="label">Directo</span>
-                <span class="value {spread_cls}">{directo_sign}{directo:.2f}%</span>
-            </div>
-            <div class="metric">
-                <span class="label">TNA Implícita</span>
-                <span class="value {tna_cls}">{tna_str}</span>
-            </div>
-        </div>
-    </div>
-    """
-
-
 def _render_pases_agro_grid(pases_dispo: list[dict], pases_futuros: list[dict]) -> None:
     for fam_code in ["SOJ", "MAI", "TRI"]:
         fam_name = GRAIN_NAMES.get(fam_code, fam_code)
@@ -588,7 +576,7 @@ def _render_dolares_financieros(
 
     st.markdown('<div class="section-title">📊 Dólares financieros</div>', unsafe_allow_html=True)
 
-    # CORRECCIÓN DE SINTAXIS: Formateamos afuera para no romper las llaves dinámicas de Streamlit
+    # Formateo seguro para no reventar las llaves de Streamlit
     sub_mep_txt = f"AL30 ÷ AL30D · {p_al30:.2f} ÷ {p_al30d:.2f}" if (p_al30 and p_al30d) else "AL30 ÷ AL30D · sin datos"
     sub_ccl_txt = f"AL30 ÷ AL30C · {p_al30:.2f} ÷ {p_al30c:.2f}" if (p_al30 and p_al30c) else "AL30 ÷ AL30C · sin datos"
 
@@ -601,6 +589,34 @@ def _render_dolares_financieros(
         st.markdown(_fin_card("Dólar CCL", ccl, ccl_pct, ccl_prev, sub_ccl_txt), unsafe_allow_html=True)
     with col_brechas:
         st.markdown(_brecha_card("Brecha CCL / MEP", brecha_ccl_mep, "(CCL ÷ MEP) − 1") + _brecha_card("Brecha MEP / A3500", brecha_mep_spot, "(MEP ÷ A3500) − 1"), unsafe_allow_html=True)
+
+
+def _render_byma_panel(title: str, emoji: str, items: list[dict],
+                       cols_per_row: int = 4, top_n: int = 60,
+                       buscar: str = "") -> None:
+    if buscar:
+        items = [it for it in items if buscar.strip().upper() in str(it.get("ticker") or it.get("ticker_ar") or it.get("symbol") or "").upper()]
+
+    def _monto(it: dict) -> float:
+        price = it.get("c") or it.get("mark") or it.get("close") or 0
+        vol = it.get("v") or it.get("v_ars") or 0
+        try: return float(price) * float(vol)
+        except: return 0.0
+
+    items_sorted = sorted(items, key=_monto, reverse=True)
+    items_view = items_sorted[:top_n]
+
+    st.markdown(f'<div class="section-title">{emoji} {title} <span class="badge">{len(items_view)} / {len(items)}</span></div>', unsafe_allow_html=True)
+
+    if not items_view:
+        st.markdown('<div class="empty-card">Sin datos todavía. Esperando respuesta de data912…</div>', unsafe_allow_html=True)
+        return
+
+    for start in range(0, len(items_view), cols_per_row):
+        chunk = items_view[start:start + cols_per_row]
+        cols = st.columns(cols_per_row)
+        for col, it in zip(cols, chunk):
+            with col: st.markdown(_render_byma_card(it), unsafe_allow_html=True)
 
 
 def main() -> None:
@@ -715,7 +731,31 @@ def main() -> None:
                 with col1: _render_tabla_rava("🏢 Acciones — Top 20", sorted(acciones, key=lambda x: float(x.get("c") or 0)*float(x.get("v") or 0), reverse=True)[:20])
                 with col2: _render_tabla_rava("🏛️ Bonos soberanos — Top 20", sorted(bonos, key=lambda x: float(x.get("c") or 0)*float(x.get("v") or 0), reverse=True)[:20])
 
-    render()
+
+# --- COMPONENTE VISUAL EXTRA: DEFINICIÓN TARJETA INDIVIDUAL BYMA ---
+def _render_byma_card(item: dict) -> str:
+    symbol = item.get("ticker") or item.get("ticker_ar") or item.get("symbol") or "—"
+    last = item.get("c") or item.get("mark")
+    pct = item.get("pct_change")
+    vol = item.get("v")
+    prev_close = item.get("close")
+    if pct is None and last and prev_close:
+        try: pct = (float(last) - float(prev_close)) / float(prev_close) * 100
+        except: pct = None
+    pct_text, pct_cls = _fmt_change(pct)
+    abs_change = _fmt_abs_change(last, prev_close)
+    abs_html = f'<span class="abs-change {pct_cls}">({abs_change})</span>' if abs_change else ""
+    return f"""
+    <div class="metric-card {pct_cls}">
+        <div class="symbol" title="{symbol}">{symbol}</div>
+        <div class="price">{_fmt_price(last)}</div>
+        <div class="change {pct_cls}">{pct_text} {abs_html}</div>
+        <div class="footer">
+            <span><span class="label">Vol.</span> <span class="value">{_fmt_int(vol)}</span></span>
+            <span><span class="label">Cierre prev.</span> <span class="value">{_fmt_price(prev_close)}</span></span>
+        </div>
+    </div>
+    """
 
 if __name__ == "__main__":
     main()
