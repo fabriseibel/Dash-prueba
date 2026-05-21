@@ -72,6 +72,7 @@ CARD_CSS = """
     font-weight: 700;
     margin-top: 6px;
 }
+.metric-card { color: #111827; }
 .metric-card .change.positive { color: #16a34a; }
 .metric-card .change.negative { color: #dc2626; }
 .metric-card .change.neutral  { color: #6b7280; }
@@ -252,7 +253,7 @@ def _fmt_abs_change(last, prev) -> str:
     return f"{sign}{diff:,.2f}"
 
 
-# --- COMPONENTE VISUAL 1: DEFINICIÓN DE TARJETAS FINANCIERAS ---
+# --- COMPONENTES VISUALES BASE (DECLARADOS AL PRINCIPIO) ---
 def _fin_card(label: str, precio: float | None, pct: float | None, prev: float | None, sub: str) -> str:
     price_str = f"${precio:,.2f}" if precio else "—"
     change_text, change_cls = _fmt_change(pct)
@@ -268,7 +269,6 @@ def _fin_card(label: str, precio: float | None, pct: float | None, prev: float |
     """
 
 
-# --- COMPONENTE VISUAL 2: DEFINICIÓN DE BRECHAS ---
 def _brecha_card(label: str, brecha: float | None, sub: str) -> str:
     if brecha is None:
         cls, val = "neutral", "—"
@@ -280,6 +280,33 @@ def _brecha_card(label: str, brecha: float | None, sub: str) -> str:
         <div class="symbol" style="margin-bottom:3px;">{label}</div>
         <div class="price" style="font-size:1.25rem;">{val}</div>
         <div style="font-size:0.72rem; color:#9ca3af; margin-top:4px;">{sub}</div>
+    </div>
+    """
+
+
+def _render_byma_card(item: dict) -> str:
+    symbol = item.get("ticker") or item.get("ticker_ar") or item.get("symbol") or "—"
+    last = item.get("c") or item.get("mark")
+    pct = item.get("pct_change")
+    vol = item.get("v")
+    prev_close = item.get("close")
+    if pct is None and last and prev_close:
+        try:
+            pct = (float(last) - float(prev_close)) / float(prev_close) * 100
+        except (TypeError, ValueError, ZeroDivisionError):
+            pct = None
+    pct_text, pct_cls = _fmt_change(pct)
+    abs_change = _fmt_abs_change(last, prev_close)
+    abs_html = f'<span class="abs-change {pct_cls}">({abs_change})</span>' if abs_change else ""
+    return f"""
+    <div class="metric-card {pct_cls}">
+        <div class="symbol" title="{symbol}">{symbol}</div>
+        <div class="price">{_fmt_price(last)}</div>
+        <div class="change {pct_cls}">{pct_text} {abs_html}</div>
+        <div class="footer">
+            <span><span class="label">Vol.</span> <span class="value">{_fmt_int(vol)}</span></span>
+            <span><span class="label">Cierre prev.</span> <span class="value">{_fmt_price(prev_close)}</span></span>
+        </div>
     </div>
     """
 
@@ -576,9 +603,13 @@ def _render_dolares_financieros(
 
     st.markdown('<div class="section-title">📊 Dólares financieros</div>', unsafe_allow_html=True)
 
-    # Formateo seguro para no reventar las llaves de Streamlit
-    sub_mep_txt = f"AL30 ÷ AL30D · {p_al30:.2f} ÷ {p_al30d:.2f}" if (p_al30 and p_al30d) else "AL30 ÷ AL30D · sin datos"
-    sub_ccl_txt = f"AL30 ÷ AL30C · {p_al30:.2f} ÷ {p_al30c:.2f}" if (p_al30 and p_al30c) else "AL30 ÷ AL30C · sin datos"
+    # CORRECCIÓN DEFINITIVA DE SINTAXIS: Formateo limpio de flotantes para evitar el colapso del f-string
+    str_p_al30 = f"{p_al30:,.2f}" if p_al30 else "—"
+    str_p_al30d = f"{p_al30d:,.2f}" if p_al30d else "—"
+    str_p_al30c = f"{p_al30c:,.2f}" if p_al30c else "—"
+
+    sub_mep_txt = f"AL30 ÷ AL30D · {str_p_al30} ÷ {str_p_al30d}"
+    sub_ccl_txt = f"AL30 ÷ AL30C · {str_p_al30} ÷ {str_p_al30c}"
 
     col_mep, col_spot, col_ccl, col_brechas = st.columns(4)
     with col_mep:
@@ -731,31 +762,7 @@ def main() -> None:
                 with col1: _render_tabla_rava("🏢 Acciones — Top 20", sorted(acciones, key=lambda x: float(x.get("c") or 0)*float(x.get("v") or 0), reverse=True)[:20])
                 with col2: _render_tabla_rava("🏛️ Bonos soberanos — Top 20", sorted(bonos, key=lambda x: float(x.get("c") or 0)*float(x.get("v") or 0), reverse=True)[:20])
 
-
-# --- COMPONENTE VISUAL EXTRA: DEFINICIÓN TARJETA INDIVIDUAL BYMA ---
-def _render_byma_card(item: dict) -> str:
-    symbol = item.get("ticker") or item.get("ticker_ar") or item.get("symbol") or "—"
-    last = item.get("c") or item.get("mark")
-    pct = item.get("pct_change")
-    vol = item.get("v")
-    prev_close = item.get("close")
-    if pct is None and last and prev_close:
-        try: pct = (float(last) - float(prev_close)) / float(prev_close) * 100
-        except: pct = None
-    pct_text, pct_cls = _fmt_change(pct)
-    abs_change = _fmt_abs_change(last, prev_close)
-    abs_html = f'<span class="abs-change {pct_cls}">({abs_change})</span>' if abs_change else ""
-    return f"""
-    <div class="metric-card {pct_cls}">
-        <div class="symbol" title="{symbol}">{symbol}</div>
-        <div class="price">{_fmt_price(last)}</div>
-        <div class="change {pct_cls}">{pct_text} {abs_html}</div>
-        <div class="footer">
-            <span><span class="label">Vol.</span> <span class="value">{_fmt_int(vol)}</span></span>
-            <span><span class="label">Cierre prev.</span> <span class="value">{_fmt_price(prev_close)}</span></span>
-        </div>
-    </div>
-    """
+    render()
 
 if __name__ == "__main__":
     main()
