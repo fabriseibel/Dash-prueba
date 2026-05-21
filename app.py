@@ -12,6 +12,7 @@ from datetime import date, datetime
 
 import pandas as pd
 import pytz
+import requests
 import streamlit as st
 
 import db
@@ -183,7 +184,6 @@ MONTHS_SHORT = {
     7: "Jul", 8: "Ago", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dic",
 }
 
-# ORDEN COMPLETO DE GRANOS REQUERIDO: SOJA -> MAIZ -> TRIGO
 GRAIN_FAMILY_ORDER = {
     "SOJ": 1,
     "MAI": 2,
@@ -204,11 +204,19 @@ def get_manager() -> RofexManager:
     return mgr
 
 
+# --- SOLUCIÓN DE CONEXIÓN LOCAL DIRECTA EN APP.PY ---
 @st.cache_data(ttl=30, show_spinner=False)
 def obtener_spot_api_cached() -> float | None:
-    val = obtener_dolar_mayorista_realtime()
-    if val and val > 1397.00:
-        return val
+    url = "https://dolarapi.com/v1/dolares/mayorista"
+    try:
+        response = requests.get(url, timeout=3)
+        if response.status_code == 200:
+            data = response.json()
+            val = float(data.get("venta", 0))
+            if val > 1397.00:
+                return val
+    except Exception:
+        pass
     return None
 
 
@@ -281,7 +289,6 @@ def _exp_to_date(exp: tuple[int, int]) -> date:
 
 
 def build_pases(rows: list[dict], consecutive_only: bool = True) -> list[dict]:
-    """Arma pases (calendar spreads) entre futuros de la misma familia organizados cronológicamente."""
     families: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
         symbol = r.get("symbol", "")
@@ -327,7 +334,6 @@ def build_pases(rows: list[dict], consecutive_only: bool = True) -> list[dict]:
             d_long = _exp_to_date(long["expiration"])
             days = (d_long - d_short).days
             
-            # Rendimiento directo y TNA implícita
             directo = (spread / p_s) * 100 if p_s > 0 else 0.0
             tna = directo * (365 / days) if days > 0 else None
 
@@ -348,7 +354,6 @@ def build_pases(rows: list[dict], consecutive_only: bool = True) -> list[dict]:
                 "expired": d_short < date.today(),
             })
             
-    # Ordenamiento por prioridad granos (SOJA -> MAIZ -> TRIGO) y luego cronológico de patas
     pases.sort(key=lambda p: (
         GRAIN_FAMILY_ORDER.get(p["family"], 99),
         parse_symbol(p["short_symbol"]).first_exp or (0, 0),
@@ -358,7 +363,6 @@ def build_pases(rows: list[dict], consecutive_only: bool = True) -> list[dict]:
 
 
 def _build_pases_disponible(granos: list[dict], precios_dispo: dict) -> list[dict]:
-    """Arma pases entre el precio disponible ingresado a mano y los futuros cargados."""
     pases = []
     today = date.today()
     for familia, precio_dispo in precios_dispo.items():
@@ -379,7 +383,6 @@ def _build_pases_disponible(granos: list[dict], precios_dispo: dict) -> list[dic
                 continue
             futuros.append({"symbol": sym, "expiration": info.first_exp, "last_price": last})
             
-        # Ordenamos los futuros por fecha para el barrido cronológico
         futuros.sort(key=lambda x: x["expiration"])
         
         for fut in futuros:
@@ -414,7 +417,6 @@ def _render_pase_card(p: dict) -> str:
     spread = p["spread"]
     spread_cls = "positive" if spread > 0 else ("negative" if spread < 0 else "")
     spread_sign = "+" if spread >= 0 else ""
-
     directo = p.get("directo", 0.0)
     directo_sign = "+" if directo >= 0 else ""
 
@@ -456,12 +458,8 @@ def _render_pase_card(p: dict) -> str:
 
 
 def _render_pases_agro_grid(pases_dispo: list[dict], pases_futuros: list[dict]) -> None:
-    """Renderiza la grilla avanzada estructurando Disponible en col1 y Spreads cronológicos en col2 y col3."""
-    # Agrupamos por familia respetando el orden estricto SOJA -> MAIZ -> TRIGO
     for fam_code in ["SOJ", "MAI", "TRI"]:
         fam_name = GRAIN_NAMES.get(fam_code, fam_code)
-        
-        # Filtrar pases correspondientes a esta familia
         f_dispo = [p for p in pases_dispo if p["family"] == fam_code]
         f_futuros = [p for p in pases_futuros if p["family"] == fam_code]
         
@@ -469,25 +467,20 @@ def _render_pases_agro_grid(pases_dispo: list[dict], pases_futuros: list[dict]) 
             continue
             
         st.markdown(f"### **{fam_name.upper()}**")
-        
-        # Armamos el layout de 3 columnas de tu estructura requerida
         col1, col2, col3 = st.columns(3)
         
         with col1:
             st.markdown(f"**Pases con Disponible**")
             if f_dispo:
-                for p in f_dispo:
-                    st.markdown(_render_card_style_pase(p), unsafe_allow_html=True)
+                for p in f_dispo: st.markdown(_render_card_style_pase(p), unsafe_allow_html=True)
             else:
                 st.markdown('<div class="empty-card">Completá el recuadro blanco de Disponible en la barra lateral.</div>', unsafe_allow_html=True)
                 
-        # Repartimos de forma equilibrada y cronológica los spreads de futuros en col2 y col3
         with col2:
             st.markdown("**Spreads Futuros (Tramo Corto)**")
             if f_futuros:
                 mitad = (len(f_futuros) + 1) // 2
-                for p in f_futuros[:mitad]:
-                    st.markdown(_render_card_style_pase(p), unsafe_allow_html=True)
+                for p in f_futuros[:mitad]: st.markdown(_render_card_style_pase(p), unsafe_allow_html=True)
             else:
                 st.markdown('<div class="empty-card">Sin spreads disponibles.</div>', unsafe_allow_html=True)
                 
@@ -495,15 +488,13 @@ def _render_pases_agro_grid(pases_dispo: list[dict], pases_futuros: list[dict]) 
             st.markdown("**Spreads Futuros (Tramo Largo)**")
             if f_futuros and len(f_futuros) > 1:
                 mitad = (len(f_futuros) + 1) // 2
-                for p in f_futuros[mitad:]:
-                    st.markdown(_render_card_style_pase(p), unsafe_allow_html=True)
+                for p in f_futuros[mitad:]: st.markdown(_render_card_style_pase(p), unsafe_allow_html=True)
             else:
                 st.markdown('<div class="empty-card">—</div>', unsafe_allow_html=True)
         st.divider()
 
 
 def _render_card_style_pase(p: dict) -> str:
-    """Helper html para renderizar la tarjeta de pase adaptada a las 3 columnas."""
     spread = p["spread"]
     spread_cls = "positive" if spread > 0 else ("negative" if spread < 0 else "")
     spread_sign = "+" if spread >= 0 else ""
@@ -543,8 +534,7 @@ def _render_pases(pases: list[dict], cols_per_row: int = 3) -> None:
             chunk = items[start:start + cols_per_row]
             cols = st.columns(cols_per_row)
             for col, p in zip(cols, chunk):
-                with col:
-                    st.markdown(_render_pase_card(p), unsafe_allow_html=True)
+                with col: st.markdown(_render_pase_card(p), unsafe_allow_html=True)
 
 
 def _render_dolares_financieros(
@@ -552,7 +542,7 @@ def _render_dolares_financieros(
     ccl_rows: list[dict],
     bonos_rows: list[dict],
     dlr_spot_row: dict | None = None,
-    mayorista_data: dict | None = None,
+    spot_from_api: float | None = None,
 ) -> None:
     bonds_by_symbol = {str(r.get("symbol", "")).upper(): r for r in bonos_rows if r.get("symbol")}
     al30, al30c, al30d = bonds_by_symbol.get("AL30"), bonds_by_symbol.get("AL30C"), bonds_by_symbol.get("AL30D")
@@ -584,10 +574,12 @@ def _render_dolares_financieros(
     mep_prev, ccl_prev = _prev(mep, mep_pct), _prev(ccl, ccl_pct)
     brecha_ccl_mep = (ccl / mep - 1) * 100 if mep and ccl and mep > 0 else None
 
-    spot = spot_pct = spot_prev = None
-    if mayorista_data:
-        spot = mayorista_data.get("venta") or mayorista_data.get("compra")
-    elif dlr_spot_row:
+    # Asignación transparente del Spot
+    spot = spot_from_api
+    spot_pct = 0.0
+    spot_prev = spot
+
+    if spot is None and dlr_spot_row:
         spot = (dlr_spot_row.get("last_price") or dlr_spot_row.get("offer") or dlr_spot_row.get("bid") or dlr_spot_row.get("prev_close"))
         spot_prev = dlr_spot_row.get("prev_close") or dlr_spot_row.get("closing_price")
         if spot and spot_prev:
@@ -602,7 +594,7 @@ def _render_dolares_financieros(
     with col_mep:
         st.markdown(_fin_card("Dólar MEP", mep, mep_pct, mep_prev, f"AL30 ÷ AL30D · {p_al30 or 0:.2f} ÷ {p_al30d or 0:.2f}"), unsafe_allow_html=True)
     with col_spot:
-        st.markdown(_fin_card("Dólar A3500", spot, spot_pct, spot_prev, "DLR/SPOT · DolarApi / Rofex" if spot else "DLR/SPOT · sin datos"), unsafe_allow_html=True)
+        st.markdown(_fin_card("Dólar A3500", spot, spot_pct, spot_prev, "Mayorista · Exacto Real-Time" if spot_from_api else "DLR/SPOT · Fallback Rofex"), unsafe_allow_html=True)
     with col_ccl:
         st.markdown(_fin_card("Dólar CCL", ccl, ccl_pct, ccl_prev, f"AL30 ÷ AL30C · {p_al30 or 0:.2f} ÷ {p_al30c or 0:.2f}"), unsafe_allow_html=True)
     with col_brechas:
@@ -618,34 +610,23 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Estado")
-        if mgr.error:
-            st.error(mgr.error)
+        if mgr.error: st.error(mgr.error)
         elif mgr.initialized:
             if hasattr(mgr, 'ws_subscribed_veta'):
-                if mgr.ws_subscribed_veta: st.success(f"✓ Veta (DLR): {len(mgr.symbols_veta)} contratos")
-                else: st.warning(f"⏳ Veta: conectando... {len(mgr.symbols_veta)} contratos")
+                st.success(f"✓ Veta (DLR): {len(mgr.symbols_veta)} contratos") if mgr.ws_subscribed_veta else st.warning(f"⏳ Veta: conectando...")
                 eco_syms = getattr(mgr, 'symbols_eco', [])
-                if getattr(mgr, 'ws_subscribed_remarkets', False): st.success(f"✓ Eco (Granos): {len(eco_syms)} contratos")
-                else: st.warning(f"⏳ Eco: conectando... {len(eco_syms)} contratos")
+                st.success(f"✓ Eco (Granos): {len(eco_syms)} contratos") if getattr(mgr, 'ws_subscribed_remarkets', False) else st.warning(f"⏳ Eco: conectando...")
             else: st.success("Conectado a REMARKETS")
         else: st.warning("Inicializando...")
 
         st.metric("Instrumentos detectados", len(mgr.symbols))
-        if db.is_connected():
-            s = db.stats()
-            st.metric("Supabase", f"✓ ON ({s['ok']} ok / {s['errors']} err)")
-        else:
-            st.metric("Supabase", "✗ OFF")
+        if db.is_connected(): st.metric("Supabase", f"✓ ON ({db.stats()['ok']} ok)")
+        else: st.metric("Supabase", "✗ OFF")
 
-        if mgr.snapshot_total:
-            if mgr.snapshot_finished: st.success(f"Snapshot ✓ {mgr.snapshot_saved}/{mgr.snapshot_total} filas")
-            else: st.progress(mgr.snapshot_done / mgr.snapshot_total if mgr.snapshot_total else 0)
-
-        if mgr.last_update:
-            st.write(f"Último tick: **{mgr.last_update.astimezone(BA_TZ).strftime('%H:%M:%S')}**")
+        if mgr.last_update: st.write(f"Último tick: **{mgr.last_update.astimezone(BA_TZ).strftime('%H:%M:%S')}**")
 
         st.divider()
-        st.subheader("APIs externas (data912)")
+        st.subheader("APIs externas (data912 / DolarApi)")
         ext_status = []
         for key in ("MEP", "CCL", "ACCIONES", "BONOS", "CEDEARS"):
             n = len(mgr.get_external(key))
@@ -653,7 +634,7 @@ def main() -> None:
             ext_status.append(f"❌ {key}: {err[:40]}" if err else f"✓ {key}: {n} filas")
         
         spot_api = obtener_spot_api_cached()
-        ext_status.append(f"✓ DolarApi: ${spot_api:,.2f} (Cached 30s)" if spot_api else "⚠️ DolarApi: Sin respuesta externa. Fallback local.")
+        ext_status.append(f"✓ DolarApi: ${spot_api:,.2f} (Cached)" if spot_api else "⚠️ DolarApi: Sin datos intradiarios nuevos.")
         st.caption("\n".join(ext_status))
 
         st.divider()
@@ -671,7 +652,6 @@ def main() -> None:
         max_pase = st.slider("Pases: máxima distancia (meses)", min_value=0, max_value=12, value=1)
         buscar = st.text_input("Buscar instrumento", placeholder="ej: DLR/AGO")
 
-        st.divider()
         cols_per_row = st.slider("Tarjetas por fila", 2, 6, 4)
         refresh_secs = st.slider("Refresco (seg)", 1, 10, 2)
 
@@ -682,11 +662,9 @@ def main() -> None:
         spot_value = obtener_spot_api_cached()
         rows = mgr.snapshot()
 
-        if underlying_filter:
-            rows = [r for r in rows if r.get("underlying") in underlying_filter]
+        if underlying_filter: rows = [r for r in rows if r.get("underlying") in underlying_filter]
         rows = [r for r in rows if keep_for_dashboard(r.get("symbol", ""), max_spread_gap=max_pase, hide_options=ocultar_opciones, hide_mayorista=ocultar_mayorista)]
-        if buscar:
-            rows = [r for r in rows if buscar.strip().upper() in r.get("symbol", "").upper()]
+        if buscar: rows = [r for r in rows if buscar.strip().upper() in r.get("symbol", "").upper()]
 
         rows.sort(key=lambda r: sort_key(r.get("symbol", ""), r.get("category", "")))
         monedas = [r for r in rows if r.get("category") == "DOLAR"]
@@ -698,13 +676,11 @@ def main() -> None:
         dlr_spot_row = next((r for r in _all_rows if r.get("symbol", "").upper() in ("DLR/SPOT", "DLR/DISPO")), None)
 
         mep_rows, ccl_rows = mgr.get_external("MEP"), mgr.get_external("CCL")
-        mayorista_raw = mgr.get_external("MAYORISTA")
-        mayorista_data = mayorista_raw if isinstance(mayorista_raw, dict) else (mayorista_raw[0] if mayorista_raw else None)
         acciones, bonos, cedears = mgr.get_external("ACCIONES"), mgr.get_external("BONOS"), mgr.get_external("CEDEARS")
 
         with placeholder.container():
-            st.caption(f"Actualizado: {datetime.now(BA_TZ).strftime('%H:%M:%S')} (Buenos Aires) · Refresco cada {refresh_secs}s")
-            _render_dolares_financieros(mep_rows, ccl_rows, bonos, dlr_spot_row, mayorista_data if spot_value else None)
+            st.caption(f"Actualizado: {datetime.now(BA_TZ).strftime('%H:%M:%S')} · Refresco cada {refresh_secs}s")
+            _render_dolares_financieros(mep_rows, ccl_rows, bonos, dlr_spot_row, spot_value)
             st.divider()
 
             pases_monedas = build_pases(monedas_puros, consecutive_only=True)
@@ -715,7 +691,7 @@ def main() -> None:
                 "MAI": precio_maiz if precio_maiz > 0 else None,
                 "TRI": precio_trigo if precio_trigo > 0 else None,
             }
-            pases_dispo = _fetch_pases_dispo = _build_pases_disponible(granos, precios_dispo)
+            pases_dispo = _build_pases_disponible(granos, precios_dispo)
 
             (tab_monedas, tab_pmon, tab_pgran, tab_granos, tab_acc, tab_bon, tab_ced, tab_heat, tab_tabla) = st.tabs([
                 f"💵 Monedas ({len(monedas_puros)})", f"🔁 Pases monedas ({len(pases_monedas)})",
