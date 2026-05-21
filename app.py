@@ -440,6 +440,7 @@ def _render_dolares_financieros(
     ccl_rows: list[dict],
     bonos_rows: list[dict],
     dlr_spot_row: dict | None = None,
+    mayorista_data: dict | None = None,
 ) -> None:
     """Calcula MEP y CCL desde arg_bonds usando AL30, AL30C y AL30D.
     Muestra también el Dólar A3500 (DLR/SPOT de pyRofex) y brechas.
@@ -509,28 +510,17 @@ def _render_dolares_financieros(
     if mep and ccl and mep > 0:
         brecha_ccl_mep = (ccl / mep - 1) * 100
 
-    # Dólar A3500 desde pyRofex (DLR/SPOT)
-    spot = None
-    spot_pct = None
-    spot_prev = None
-    # Dólar mayorista desde dolarapi.com (precio en vivo)
-    mayorista_rows = mgr.get_external("MAYORISTA") if hasattr(mgr, 'get_external') else []
-    mayorista_data = mayorista_rows if isinstance(mayorista_rows, dict) else (mayorista_rows[0] if mayorista_rows else None)
+ spot = spot_pct = spot_prev = None
     if mayorista_data:
         spot = mayorista_data.get("venta") or mayorista_data.get("compra")
-        spot_prev = None
-        spot_pct = None
     elif dlr_spot_row:
         spot = (dlr_spot_row.get("last_price") or dlr_spot_row.get("offer") or
                 dlr_spot_row.get("bid") or dlr_spot_row.get("prev_close") or
                 dlr_spot_row.get("closing_price"))
         spot_prev = dlr_spot_row.get("prev_close") or dlr_spot_row.get("closing_price")
-        spot_pct = None
         if spot and spot_prev:
             try: spot_pct = (spot - spot_prev) / spot_prev * 100
             except: pass
-    else:
-        spot = spot_prev = spot_pct = None
 
     # Brecha MEP / A3500
     brecha_mep_spot = None
@@ -1104,6 +1094,8 @@ def main() -> None:
         # Datos externos (data912): MEP, CCL, acciones, bonos, CEDEARs
         mep_rows = mgr.get_external("MEP")
         ccl_rows = mgr.get_external("CCL")
+        mayorista_raw = mgr.get_external("MAYORISTA")
+        mayorista_data = mayorista_raw if isinstance(mayorista_raw, dict) else (mayorista_raw[0] if mayorista_raw else None)
         acciones = mgr.get_external("ACCIONES")
         bonos = mgr.get_external("BONOS")
         cedears = mgr.get_external("CEDEARS")
@@ -1113,7 +1105,7 @@ def main() -> None:
             st.caption(f"Actualizado: {now_ba} (Buenos Aires) · "
                        f"Refresco automático cada {refresh_secs}s")
 
-            _render_dolares_financieros(mep_rows, ccl_rows, bonos, dlr_spot_row)
+            _render_dolares_financieros(mep_rows, ccl_rows, bonos, dlr_spot_row, mayorista_data)
             st.divider()
 
             pases_monedas = build_pases(monedas_puros, consecutive_only=True)
