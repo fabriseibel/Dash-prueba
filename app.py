@@ -1,8 +1,10 @@
 """Dashboard Streamlit: precios en tiempo real de dólares y granos
-desde Matba Rofex (pyRofex WebSocket) con persistencia en Supabase."""
+desde Matba Rofex (pyRofex WebSocket) con persistencia en Supabase.
+
+Diseño basado en tarjetas dinámicas que se refrescan automáticamente
+a medida que entran nuevos ticks (desde el WebSocket → memoria + Supabase)."""
 from __future__ import annotations
 
-import time
 from calendar import monthrange
 from collections import defaultdict
 from datetime import date, datetime
@@ -13,7 +15,7 @@ import streamlit as st
 
 import db
 from rofex_manager import RofexManager
-from symbol_utils import keep_for_dashboard, display_symbol, parse_symbol, sort_key, obtener_dolar_mayorista_realtime
+from symbol_utils import keep_for_dashboard, display_symbol, parse_symbol, sort_key
 
 st.set_page_config(
     page_title="Matba Rofex Dashboard",
@@ -187,14 +189,6 @@ def get_manager() -> RofexManager:
     return mgr
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def obtener_spot_api_cached() -> float | None:
-    val = obtener_dolar_mayorista_realtime()
-    if val and val > 0:
-        return val
-    return None
-
-
 def _fmt_price(v) -> str:
     if v is None or pd.isna(v):
         return "—"
@@ -211,6 +205,7 @@ def _fmt_int(v) -> str:
 
 
 def _fmt_change(v) -> tuple[str, str]:
+    """Devuelve (texto, clase css) para la variación porcentual."""
     if v is None or pd.isna(v):
         return "—", "neutral"
     if v > 0:
@@ -221,6 +216,7 @@ def _fmt_change(v) -> tuple[str, str]:
 
 
 def _fmt_abs_change(last, prev) -> str:
+    """Diferencia absoluta entre el último precio y el cierre previo."""
     if last is None or prev is None or pd.isna(last) or pd.isna(prev):
         return ""
     diff = last - prev
@@ -237,7 +233,10 @@ def _render_card(row: dict) -> str:
 
     change_text, change_cls = _fmt_change(change)
     abs_change = _fmt_abs_change(last, prev_close)
-    abs_html = f'<span class="abs-change {change_cls}">({abs_change})</span>' if abs_change else ""
+    abs_html = (
+        f'<span class="abs-change {change_cls}">({abs_change})</span>'
+        if abs_change else ""
+    )
     card_cls = change_cls
 
     return f"""
@@ -259,11 +258,19 @@ def _exp_label(exp: tuple[int, int]) -> str:
 
 
 def _exp_to_date(exp: tuple[int, int]) -> date:
+    """Aproxima el vencimiento al último día calendario del mes."""
     y, m = exp
     return date(y, m, monthrange(y, m)[1])
 
 
 def build_pases(rows: list[dict], consecutive_only: bool = True) -> list[dict]:
+    """Arma pases (calendar spreads) entre futuros de la misma familia.
+
+    - `consecutive_only=True` (monedas): solo pares mes-a-mes consecutivos
+      (Abr→May, May→Jun, etc.).
+    - `consecutive_only=False` (granos): todos los pares posibles,
+      pero solo si ambas patas tienen `trade_volume > 0`.
+    """
     families: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
         symbol = r.get("symbol", "")
@@ -274,6 +281,7 @@ def build_pases(rows: list[dict], consecutive_only: bool = True) -> list[dict]:
             continue
         if r.get("last_price") in (None, 0):
             continue
+        # Para granos: ambas patas deben tener volumen
         if not consecutive_only and not (r.get("trade_volume") or 0) > 0:
             continue
         families[info.family].append({
@@ -295,8 +303,10 @@ def build_pases(rows: list[dict], consecutive_only: bool = True) -> list[dict]:
         sorted_items = sorted(unique.values(), key=lambda x: x["expiration"])
 
         if consecutive_only:
+            # Solo pares adyacentes en la lista ordenada
             pairs = list(zip(sorted_items, sorted_items[1:]))
         else:
+            # Todos los pares posibles (combinaciones de 2)
             from itertools import combinations
             pairs = list(combinations(sorted_items, 2))
 
@@ -374,11 +384,20 @@ def _render_pase_card(p: dict) -> str:
 
 
 def _render_pases(pases: list[dict], cols_per_row: int = 3) -> None:
-    st.markdown(f'<div class="section-title">🔁 Pases calculados <span class="badge">{len(pases)}</span></div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="section-title">🔁 Pases calculados '
+        f'<span class="badge">{len(pases)}</span></div>',
+        unsafe_allow_html=True,
+    )
     if not pases:
-        st.markdown('<div class="empty-card">No hay suficientes contratos con precio para armar pases todavía.</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="empty-card">No hay suficientes contratos con precio '
+            "para armar pases todavía.</div>",
+            unsafe_allow_html=True,
+        )
         return
 
+    # Agrupar por familia para que se vean ordenados
     by_family: dict[str, list[dict]] = defaultdict(list)
     for p in pases:
         by_family[p["family_name"]].append(p)
@@ -394,6 +413,7 @@ def _render_pases(pases: list[dict], cols_per_row: int = 3) -> None:
 
 
 def _weighted_avg(items: list[dict], price_key: str, weight_key: str) -> float | None:
+    """Promedio ponderado de `price_key` por `weight_key`. Ignora valores inválidos."""
     num = 0.0
     den = 0.0
     for it in items:
@@ -419,15 +439,21 @@ def _render_dolares_financieros(
     mep_rows: list[dict],
     ccl_rows: list[dict],
     bonos_rows: list[dict],
-    spot_from_api: float | None = None,
+    dlr_spot_row: dict | None = None,
 ) -> None:
+    """Calcula MEP y CCL desde arg_bonds usando AL30, AL30C y AL30D.
+    Muestra también el Dólar A3500 (DLR/SPOT de pyRofex) y brechas.
+
+    MEP = AL30 (ARS) ÷ AL30D (USD MEP)
+    CCL = AL30 (ARS) ÷ AL30C (USD cable)
+    """
     bonds_by_symbol = {
         str(r.get("symbol", "")).upper(): r
         for r in bonos_rows
         if r.get("symbol")
     }
 
-    al30 = bonds_by_symbol.get("AL30")
+    al30  = bonds_by_symbol.get("AL30")
     al30c = bonds_by_symbol.get("AL30C")
     al30d = bonds_by_symbol.get("AL30D")
 
@@ -440,7 +466,7 @@ def _render_dolares_financieros(
         except (TypeError, ValueError):
             return None
 
-    p_al30 = _price(al30)
+    p_al30  = _price(al30)
     p_al30c = _price(al30c)
     p_al30d = _price(al30d)
 
@@ -461,7 +487,7 @@ def _render_dolares_financieros(
         except (TypeError, ValueError):
             return None
 
-    pct_al30 = _pct(al30)
+    pct_al30  = _pct(al30)
     pct_al30c = _pct(al30c)
     pct_al30d = _pct(al30d)
 
@@ -483,21 +509,48 @@ def _render_dolares_financieros(
     if mep and ccl and mep > 0:
         brecha_ccl_mep = (ccl / mep - 1) * 100
 
-    spot = spot_from_api
-    spot_pct = 0.0
-    spot_prev = spot
+    # Dólar A3500 desde pyRofex (DLR/SPOT)
+    spot = None
+    spot_pct = None
+    spot_prev = None
+    # Dólar mayorista desde dolarapi.com (precio en vivo)
+    mayorista_rows = mgr.get_external("MAYORISTA") if hasattr(mgr, 'get_external') else []
+    mayorista_data = mayorista_rows if isinstance(mayorista_rows, dict) else (mayorista_rows[0] if mayorista_rows else None)
+    if mayorista_data:
+        spot = mayorista_data.get("venta") or mayorista_data.get("compra")
+        spot_prev = None
+        spot_pct = None
+    elif dlr_spot_row:
+        spot = (dlr_spot_row.get("last_price") or dlr_spot_row.get("offer") or
+                dlr_spot_row.get("bid") or dlr_spot_row.get("prev_close") or
+                dlr_spot_row.get("closing_price"))
+        spot_prev = dlr_spot_row.get("prev_close") or dlr_spot_row.get("closing_price")
+        spot_pct = None
+        if spot and spot_prev:
+            try: spot_pct = (spot - spot_prev) / spot_prev * 100
+            except: pass
+    else:
+        spot = spot_prev = spot_pct = None
 
+    # Brecha MEP / A3500
     brecha_mep_spot = None
     if mep and spot and spot > 0:
         brecha_mep_spot = (mep / spot - 1) * 100
 
-    st.markdown('<div class="section-title">📊 Dólares financieros</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="section-title">📊 Dólares financieros</div>',
+        unsafe_allow_html=True,
+    )
 
-    def _fin_card(label: str, precio: float | None, pct: float | None, prev: float | None, sub: str) -> str:
+    def _fin_card(label: str, precio: float | None, pct: float | None,
+                  prev: float | None, sub: str) -> str:
         price_str = f"${precio:,.2f}" if precio else "—"
         change_text, change_cls = _fmt_change(pct)
         abs_change = _fmt_abs_change(precio, prev)
-        abs_html = f'<span class="abs-change {change_cls}">({abs_change})</span>' if abs_change else ""
+        abs_html = (
+            f'<span class="abs-change {change_cls}">({abs_change})</span>'
+            if abs_change else ""
+        )
         return f"""
         <div class="metric-card {change_cls}">
             <div class="symbol">{label}</div>
@@ -521,6 +574,7 @@ def _render_dolares_financieros(
         </div>
         """
 
+    # Layout: MEP | A3500 | CCL | [Brecha CCL/MEP encima / Brecha MEP/A3500 abajo]
     col_mep, col_spot, col_ccl, col_brechas = st.columns(4)
 
     with col_mep:
@@ -528,7 +582,7 @@ def _render_dolares_financieros(
         st.markdown(_fin_card("Dólar MEP", mep, mep_pct, mep_prev, sub_mep), unsafe_allow_html=True)
 
     with col_spot:
-        sub_spot = "Mayorista · DolarApi tiempo real" if spot else "DolarApi · sin datos"
+        sub_spot = "DLR/SPOT · pyRofex" if spot else "DLR/SPOT · sin datos"
         st.markdown(_fin_card("Dólar A3500", spot, spot_pct, spot_prev, sub_spot), unsafe_allow_html=True)
 
     with col_ccl:
@@ -550,6 +604,7 @@ def _render_byma_card(item: dict) -> str:
     vol = item.get("v")
     prev_close = item.get("close")
 
+    # Calcular pct_change si no viene o es None
     if pct is None and last and prev_close:
         try:
             pct = (float(last) - float(prev_close)) / float(prev_close) * 100
@@ -558,7 +613,10 @@ def _render_byma_card(item: dict) -> str:
 
     pct_text, pct_cls = _fmt_change(pct)
     abs_change = _fmt_abs_change(last, prev_close)
-    abs_html = f'<span class="abs-change {pct_cls}">({abs_change})</span>' if abs_change else ""
+    abs_html = (
+        f'<span class="abs-change {pct_cls}">({abs_change})</span>'
+        if abs_change else ""
+    )
     card_cls = pct_cls
 
     return f"""
@@ -574,6 +632,7 @@ def _render_byma_card(item: dict) -> str:
     """
 
 
+# Capitalización de mercado en millones de ARS
 _CAP_MERC: dict[str, float] = {
     "YPFD": 25270, "GGAL": 10380, "TECO2": 7290, "BMA": 7090, "TGSU2": 6810,
     "PAMP": 6500, "BBAR": 4410, "CEPU": 3270, "TXAR": 3150, "ALUA": 2780,
@@ -623,6 +682,8 @@ _SECTORES: dict[str, str] = {
 
 
 def _render_heatmap(acciones: list[dict]) -> None:
+    """Treemap de acciones BYMA agrupado por sector.
+    Tamaño = capitalización de mercado. Color = variación % del día."""
     import plotly.graph_objects as go
 
     rows = {
@@ -633,6 +694,7 @@ def _render_heatmap(acciones: list[dict]) -> None:
 
     ids, labels, parents, values, colors, custom = [], [], [], [], [], []
 
+    # Calcular cap total por sector para los nodos padre
     sectores_cap: dict[str, float] = {}
     for ticker, cap in _CAP_MERC.items():
         if ticker not in rows:
@@ -640,6 +702,7 @@ def _render_heatmap(acciones: list[dict]) -> None:
         sector = _SECTORES.get(ticker, "Otros")
         sectores_cap[sector] = sectores_cap.get(sector, 0) + cap
 
+    # Nodos padre (sectores)
     for sector, total_cap in sectores_cap.items():
         ids.append(sector)
         labels.append(f"<b>{sector}</b>")
@@ -648,23 +711,24 @@ def _render_heatmap(acciones: list[dict]) -> None:
         colors.append(0.0)
         custom.append(f"<b>{sector}</b>")
 
+    # Nodos hoja (acciones)
     for ticker, cap in _CAP_MERC.items():
         r = rows.get(ticker)
         if r is None:
             continue
         sector = _SECTORES.get(ticker, "Otros")
         precio = float(r.get("c") or 0)
-        pct = float(r.get("pct_change") or 0)
-        vol = int(r.get("v") or 0)
+        pct    = float(r.get("pct_change") or 0)
+        vol    = int(r.get("v") or 0)
         ids.append(ticker)
-        labels.append(f"{ticker}<br>{'+' if pct>=0 else ''}{pct:.2f}%")
+        labels.append(f"{ticker}<br>{'+'if pct>=0 else ''}{pct:.2f}%")
         parents.append(sector)
         values.append(cap)
         colors.append(pct)
         custom.append(
             f"<b>{ticker}</b><br>"
             f"Precio: ${precio:,.2f}<br>"
-            f"Var: {'+' if pct>=0 else ''}{pct:.2f}%<br>"
+            f"Var: {'+'if pct>=0 else ''}{pct:.2f}%<br>"
             f"Cap. Merc.: ${cap:,.0f}M<br>"
             f"Vol: {vol:,}"
         )
@@ -676,6 +740,7 @@ def _render_heatmap(acciones: list[dict]) -> None:
     max_abs = max((abs(c) for c in colors if c != 0.0), default=3)
     max_abs = max(max_abs, 1)
 
+    # Escala estilo Finviz: rojo puro → negro → verde puro
     colorscale = [
         [0.0,  "#9A0000"],
         [0.2,  "#CC0000"],
@@ -729,6 +794,7 @@ def _render_heatmap(acciones: list[dict]) -> None:
 def _render_byma_panel(title: str, emoji: str, items: list[dict],
                        cols_per_row: int = 4, top_n: int = 60,
                        buscar: str = "") -> None:
+    """Render generico para acciones, bonos y CEDEARs (fuente data912)."""
     if buscar:
         q = buscar.strip().upper()
         items = [
@@ -736,6 +802,7 @@ def _render_byma_panel(title: str, emoji: str, items: list[dict],
             if q in str(it.get("ticker") or it.get("ticker_ar") or it.get("symbol") or "").upper()
         ]
 
+    # Ordeno por monto operado (precio × cantidad) descendente
     def _monto(it: dict) -> float:
         price = it.get("c") or it.get("mark") or it.get("close") or 0
         vol = it.get("v") or it.get("v_ars") or 0
@@ -747,10 +814,17 @@ def _render_byma_panel(title: str, emoji: str, items: list[dict],
     items_sorted = sorted(items, key=_monto, reverse=True)
     items_view = items_sorted[:top_n]
 
-    st.markdown(f'<div class="section-title">{emoji} {title} <span class="badge">{len(items_view)} / {len(items)}</span></div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="section-title">{emoji} {title} '
+        f'<span class="badge">{len(items_view)} / {len(items)}</span></div>',
+        unsafe_allow_html=True,
+    )
 
     if not items_view:
-        st.markdown('<div class="empty-card">Sin datos todavía. Esperando respuesta de data912…</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="empty-card">Sin datos todavía. Esperando respuesta de data912…</div>',
+            unsafe_allow_html=True,
+        )
         return
 
     for start in range(0, len(items_view), cols_per_row):
@@ -762,10 +836,18 @@ def _render_byma_panel(title: str, emoji: str, items: list[dict],
 
 
 def _render_group(title: str, emoji: str, rows: list[dict], cols_per_row: int = 4) -> None:
-    st.markdown(f'<div class="section-title">{emoji} {title} <span class="badge">{len(rows)}</span></div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="section-title">{emoji} {title} '
+        f'<span class="badge">{len(rows)}</span></div>',
+        unsafe_allow_html=True,
+    )
 
     if not rows:
-        st.markdown('<div class="empty-card">Sin datos para mostrar todavía. Esperando primeros ticks del mercado…</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="empty-card">Sin datos para mostrar todavía. '
+            "Esperando primeros ticks del mercado…</div>",
+            unsafe_allow_html=True,
+        )
         return
 
     for start in range(0, len(rows), cols_per_row):
@@ -777,6 +859,7 @@ def _render_group(title: str, emoji: str, rows: list[dict], cols_per_row: int = 
         for col in cols[len(chunk):]:
             with col:
                 st.empty()
+
 
 
 TABLE_CSS_RAVA = """
@@ -809,7 +892,7 @@ def _render_tabla_rava(titulo, items, symbol_field="symbol", price_field="c",
         try:
             f = float(v)
             cls = "rv-pos" if f>0 else ("rv-neg" if f<0 else "rv-neu")
-            return f'<span class="{cls}">{"+" if f>0 else ""}{f:.2f}%</span>'
+            return f'<span class="{cls}>{"+" if f>0 else ""}{f:.2f}%</span>'
         except: return "—"
     def _vol(v):
         if v is None: return '<span class="rv-neu">—</span>'
@@ -827,6 +910,56 @@ def _render_tabla_rava(titulo, items, symbol_field="symbol", price_field="c",
         rows_html = '<tr><td colspan="5" style="color:#6b7280;text-align:center;padding:12px;">Sin datos</td></tr>'
     st.markdown(f"""{TABLE_CSS_RAVA}<div class="rava-wrap"><div class="rava-title">{titulo}</div><table class="rava-table"><thead><tr><th>Especie</th><th>Último</th><th>% Día</th><th>Volumen</th><th>Cierre ant.</th></tr></thead><tbody>{rows_html}</tbody></table></div>""", unsafe_allow_html=True)
 
+
+GRAIN_FAMILY_MAP = {
+    "SOJ": ["SOJ.ROS", "SOJ"],
+    "MAI": ["MAI.ROS", "MAI"],
+    "TRI": ["TRI.ROS", "TRI"],
+}
+
+def _build_pases_disponible(granos: list[dict], precios_dispo: dict) -> list[dict]:
+    """Arma pases entre precio disponible (BCR) y futuros para soja, maíz y trigo."""
+    from datetime import date
+    pases = []
+    today = date.today()
+    for familia, precio_dispo in precios_dispo.items():
+        if not precio_dispo: continue
+        # Buscar futuros de esta familia con precio
+        prefixes = GRAIN_FAMILY_MAP.get(familia, [familia])
+        futuros = []
+        for r in granos:
+            sym = r.get("symbol", "")
+            if not any(sym.upper().startswith(p.upper()) for p in prefixes): continue
+            info = parse_symbol(sym)
+            if info.is_spread or info.is_option or not info.first_exp: continue
+            last = r.get("last_price")
+            if not last: continue
+            futuros.append({"symbol": sym, "expiration": info.first_exp, "last_price": last})
+        futuros.sort(key=lambda x: x["expiration"])
+        for fut in futuros:
+            p_fut = fut["last_price"]
+            spread = p_fut - precio_dispo
+            d_fut = _exp_to_date(fut["expiration"])
+            days = (d_fut - today).days
+            tna = None
+            if days > 0 and precio_dispo > 0:
+                tna = ((p_fut / precio_dispo) - 1) * (365 / days) * 100
+            pases.append({
+                "family": familia,
+                "family_name": GRAIN_NAMES.get(familia, familia),
+                "underlying": familia,
+                "short_symbol": f"{familia}/DISPO",
+                "long_symbol": fut["symbol"],
+                "short_label": "Dispo",
+                "long_label": _exp_label(fut["expiration"]),
+                "p_short": precio_dispo,
+                "p_long": p_fut,
+                "spread": spread,
+                "days": days,
+                "tna": tna,
+                "expired": False,
+            })
+    return pases
 
 def main() -> None:
     st.markdown(CARD_CSS, unsafe_allow_html=True)
@@ -873,11 +1006,10 @@ def main() -> None:
             st.write(f"Último tick: **{local.strftime('%H:%M:%S')}**")
 
         st.divider()
-        st.subheader("APIs externas (data912 / DolarApi)")
+        st.subheader("APIs externas (data912)")
         if mgr.external_last_update:
             local_ext = mgr.external_last_update.astimezone(BA_TZ)
-            st.caption(f"Última actualización data912: **{local_ext.strftime('%H:%M:%S')}**")
-        
+            st.caption(f"Última actualización: **{local_ext.strftime('%H:%M:%S')}**")
         ext_status = []
         for key in ("MEP", "CCL", "ACCIONES", "BONOS", "CEDEARS"):
             n = len(mgr.get_external(key))
@@ -886,15 +1018,14 @@ def main() -> None:
                 ext_status.append(f"❌ {key}: {err[:40]}")
             else:
                 ext_status.append(f"✓ {key}: {n} filas")
-        
-        # Indicador inteligente de procedencia del SPOT en la barra lateral
-        spot_check = obtener_spot_api_cached()
-        if spot_check:
-            ext_status.append(f"✓ DolarApi: ${spot_check:,.2f} (Cached 60s)")
-        else:
-            ext_status.append("⚠️ DolarApi: Sin respuesta. Usando SPOT Matba Rofex")
-            
         st.caption("\n".join(ext_status))
+
+
+        st.divider()
+        st.subheader("🌾 Precios disponibles (BCR)")
+        precio_soja = st.number_input("Soja disponible (U$S/t)", min_value=0.0, value=0.0, step=0.5, format="%.2f")
+        precio_maiz = st.number_input("Maíz disponible (U$S/t)", min_value=0.0, value=0.0, step=0.5, format="%.2f")
+        precio_trigo = st.number_input("Trigo disponible (U$S/t)", min_value=0.0, value=0.0, step=0.5, format="%.2f")
 
         st.divider()
         st.subheader("Filtros")
@@ -927,30 +1058,7 @@ def main() -> None:
 
     @st.fragment(run_every=refresh_secs)
     def render():
-        # 1. Intentamos leer el valor de la caché de DolarApi
-        spot_value = obtener_spot_api_cached()
-        
-        # 2. Levantamos el snapshot de Matba Rofex
         rows = mgr.snapshot()
-
-        # 3. FILTRO INTELIGENTE: Si DolarApi viene retrasado (<= 1397), usamos el intradiario real de Rofex
-        if spot_value is None or spot_value <= 1397.00:
-            # Buscamos la posición más corta o el SPOT directo cotizando en Rofex
-            dlr_spot_row = next(
-                (r for r in rows if r.get("symbol", "").upper() in ("DLR/SPOT", "DLR/DISPO")),
-                None,
-            )
-            # Si no encuentra el SPOT específico, tomamos el valor de la punta del mes más cercano operado
-            if not dlr_spot_row:
-                dlr_spot_row = next(
-                    (r for r in rows if "DLR/" in r.get("symbol", "").upper() and not parse_symbol(r.get("symbol", "")).is_spread),
-                    None,
-                )
-            
-            if dlr_spot_row:
-                spot_value = (dlr_spot_row.get("last_price") or dlr_spot_row.get("offer") or
-                              dlr_spot_row.get("bid") or dlr_spot_row.get("prev_close") or
-                              dlr_spot_row.get("closing_price"))
 
         if underlying_filter:
             rows = [r for r in rows if r.get("underlying") in underlying_filter]
@@ -974,6 +1082,9 @@ def main() -> None:
         monedas = [r for r in rows if r.get("category") == "DOLAR"]
         granos = [r for r in rows if r.get("category") == "GRANO"]
 
+        # En Monedas mostramos solo dólares puros: sin pases ya cotizados,
+        # sin DISPO/SPOT y sin mayorista (el filtro de mayorista ya se aplicó arriba),
+        # así quedan únicamente los DLR/MES+AA.
         monedas_puros = [
             r for r in monedas
             if (info := parse_symbol(r.get("symbol", "")))
@@ -982,6 +1093,15 @@ def main() -> None:
             and "SPOT" not in r.get("symbol", "").upper()
         ]
 
+        # DLR/SPOT: precio de referencia A3500 desde pyRofex
+        # Se busca en el snapshot completo (antes de filtrar monedas_puros)
+        _all_rows = mgr.snapshot()
+        dlr_spot_row = next(
+            (r for r in _all_rows if r.get("symbol", "").upper() in ("DLR/SPOT", "DLR/DISPO")),
+            None,
+        )
+
+        # Datos externos (data912): MEP, CCL, acciones, bonos, CEDEARs
         mep_rows = mgr.get_external("MEP")
         ccl_rows = mgr.get_external("CCL")
         acciones = mgr.get_external("ACCIONES")
@@ -990,9 +1110,10 @@ def main() -> None:
 
         with placeholder.container():
             now_ba = datetime.now(BA_TZ).strftime("%H:%M:%S")
-            st.caption(f"Actualizado: {now_ba} (Buenos Aires) · Refresco automático cada {refresh_secs}s")
+            st.caption(f"Actualizado: {now_ba} (Buenos Aires) · "
+                       f"Refresco automático cada {refresh_secs}s")
 
-            _render_dolares_financieros(mep_rows, ccl_rows, bonos, spot_value)
+            _render_dolares_financieros(mep_rows, ccl_rows, bonos, dlr_spot_row)
             st.divider()
 
             pases_monedas = build_pases(monedas_puros, consecutive_only=True)
@@ -1022,12 +1143,26 @@ def main() -> None:
                 _render_group("Granos", "🌾", granos, cols_per_row=cols_per_row)
             with tab_pgran:
                 _render_pases(pases_granos, cols_per_row=min(cols_per_row, 3))
+                # Pases disponible → futuro
+                precios_dispo = {
+                    "SOJ": precio_soja if precio_soja > 0 else None,
+                    "MAI": precio_maiz if precio_maiz > 0 else None,
+                    "TRI": precio_trigo if precio_trigo > 0 else None,
+                }
+                pases_dispo = _build_pases_disponible(granos, precios_dispo)
+                if pases_dispo:
+                    st.markdown("**Disponible → Futuro**")
+                    _render_pases(pases_dispo, cols_per_row=min(cols_per_row, 3))
+
             with tab_acc:
-                _render_byma_panel("Acciones BYMA", "🏢", acciones, cols_per_row=cols_per_row, buscar=buscar)
+                _render_byma_panel("Acciones BYMA", "🏢", acciones,
+                                   cols_per_row=cols_per_row, buscar=buscar)
             with tab_bon:
-                _render_byma_panel("Bonos soberanos", "🏛️", bonos, cols_per_row=cols_per_row, buscar=buscar)
+                _render_byma_panel("Bonos soberanos", "🏛️", bonos,
+                                   cols_per_row=cols_per_row, buscar=buscar)
             with tab_ced:
-                _render_byma_panel("CEDEARs", "🍎", cedears, cols_per_row=cols_per_row, buscar=buscar)
+                _render_byma_panel("CEDEARs", "🍎", cedears,
+                                   cols_per_row=cols_per_row, buscar=buscar)
             with tab_heat:
                 _render_heatmap(acciones)
             with tab_tabla:
