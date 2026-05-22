@@ -540,23 +540,7 @@ def _render_pases_agro(
 
         st.markdown(f"### {fam_name}")
 
-        # Input de precio disponible directo en la página
-        precio_sidebar = precios_dispo.get(fam) or 0.0
-        nuevo_precio = st.number_input(
-            f"Disponible {fam_name} (U$S/t)",
-            min_value=0.0,
-            value=float(precio_sidebar),
-            step=0.5,
-            format="%.2f",
-            key=f"dispo_inline_{fam}",
-        )
-
-        # Recalcular pases dispo con el precio ingresado en la página
-        dispo_items = (
-            _build_pases_disponible(granos, {fam: nuevo_precio})
-            if nuevo_precio > 0
-            else []
-        )
+    dispo_items = by_family_dispo.get(fam, [])
 
         has_dispo = bool(dispo_items)
         has_fut   = bool(fut_items)
