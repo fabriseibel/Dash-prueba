@@ -1083,6 +1083,44 @@ def _render_tabla_rava(titulo, items, symbol_field="symbol", price_field="c",
     )
 
 
+
+# ── scraping precios pizarra BCR ─────────────────────────────────────────────
+
+def _fetch_bcr_pizarra() -> dict[str, float]:
+    """Scrapea precios de pizarra BCR (U$S/t) desde cac.bcr.com.ar.
+    Devuelve {"SOJ": x, "MAI": x, "TRI": x, "GIR": x, "SOR": x} con lo que encuentre.
+    """
+    import re
+    import requests
+    from bs4 import BeautifulSoup
+    try:
+        r = requests.get(
+            "https://www.cac.bcr.com.ar/es/precios-de-pizarra",
+            timeout=8,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        soup = BeautifulSoup(r.text, "html.parser")
+        text = soup.get_text()
+        PATRONES = {
+            "TRI": r"Trigo[\s\S]{0,120}?US\$\s*([\d.,]+)",
+            "MAI": r"Ma[íi]z[\s\S]{0,120}?US\$\s*([\d.,]+)",
+            "GIR": r"Girasol[\s\S]{0,120}?US\$\s*(?:\(E\)\s*)?([\d.,]+)",
+            "SOJ": r"Soja[\s\S]{0,120}?US\$\s*([\d.,]+)",
+            "SOR": r"Sorgo[\s\S]{0,120}?US\$\s*([\d.,]+)",
+        }
+        result = {}
+        for fam, pat in PATRONES.items():
+            m = re.search(pat, text)
+            if m:
+                val = m.group(1).replace(".", "").replace(",", ".")
+                try:
+                    result[fam] = float(val)
+                except ValueError:
+                    pass
+        return result
+    except Exception:
+        return {}
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -1168,15 +1206,28 @@ def main() -> None:
     if mgr.error:
         st.stop()
 
+    # Cargar precios BCR automáticamente al inicio de la sesión
+    if "bcr_loaded" not in st.session_state:
+        with st.spinner("Cargando precios pizarra BCR..."):
+            bcr = _fetch_bcr_pizarra()
+        for fam, precio in bcr.items():
+            st.session_state[f"dispo_{fam}"] = precio
+        st.session_state["bcr_loaded"] = True
+        st.session_state["bcr_precios"] = bcr
+
+    bcr_ok = bool(st.session_state.get("bcr_precios"))
+    bcr_caption = "✅ Precargado desde cac.bcr.com.ar · editá si querés ajustar" if bcr_ok else "⚠️ No se pudo cargar BCR · ingresá manualmente"
+
     # Inputs de disponible fuera del fragment
     with st.expander("🌾 Precios disponibles (BCR)", expanded=True):
+        st.caption(bcr_caption)
         _c1, _c2, _c3 = st.columns(3)
         with _c1:
-            st.number_input("Soja (U$S/t)",  min_value=0.0, value=0.0, step=0.5, format="%.2f", key="dispo_SOJ")
+            st.number_input("Soja (U$S/t)",  min_value=0.0, value=float(st.session_state.get("dispo_SOJ", 0.0)), step=0.5, format="%.2f", key="dispo_SOJ")
         with _c2:
-            st.number_input("Maíz (U$S/t)",  min_value=0.0, value=0.0, step=0.5, format="%.2f", key="dispo_MAI")
+            st.number_input("Maíz (U$S/t)",  min_value=0.0, value=float(st.session_state.get("dispo_MAI", 0.0)), step=0.5, format="%.2f", key="dispo_MAI")
         with _c3:
-            st.number_input("Trigo (U$S/t)", min_value=0.0, value=0.0, step=0.5, format="%.2f", key="dispo_TRI")
+            st.number_input("Trigo (U$S/t)", min_value=0.0, value=float(st.session_state.get("dispo_TRI", 0.0)), step=0.5, format="%.2f", key="dispo_TRI")
 
     placeholder = st.empty()
 
