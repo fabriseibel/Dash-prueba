@@ -540,7 +540,7 @@ def _render_pases_agro(
 
         st.markdown(f"### {fam_name}")
 
-    dispo_items = by_family_dispo.get(fam, [])
+        dispo_items = by_family_dispo.get(fam, [])
 
         has_dispo = bool(dispo_items)
         has_fut   = bool(fut_items)
