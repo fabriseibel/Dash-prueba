@@ -355,6 +355,16 @@ def _render_pase_card(p: dict) -> str:
         tna_sign = "+" if tna >= 0 else ""
         tna_str = f"{tna_sign}{tna:.2f}%"
 
+    # Rendimiento directo: spread / precio_short * 100
+    p_short = p.get("p_short")
+    if p_short and p_short > 0:
+        directo = (spread / p_short) * 100
+        directo_cls = "positive" if directo > 0 else ("negative" if directo < 0 else "")
+        directo_str = f"{'+'if directo>=0 else ''}{directo:.2f}%"
+    else:
+        directo_str = "—"
+        directo_cls = ""
+
     return f"""
     <div class="pase-card">
         <div class="pair">
@@ -373,6 +383,10 @@ def _render_pase_card(p: dict) -> str:
             <div class="metric">
                 <span class="label">Diferencia</span>
                 <span class="value {spread_cls}">{spread_sign}{spread:,.2f}</span>
+            </div>
+            <div class="metric">
+                <span class="label">Directo</span>
+                <span class="value {directo_cls}">{directo_str}</span>
             </div>
             <div class="metric">
                 <span class="label">TNA implícita</span>
@@ -1134,13 +1148,13 @@ def main() -> None:
             with tab_granos:
                 _render_group("Granos", "🌾", granos, cols_per_row=cols_per_row)
             with tab_pgran:
-                _render_pases(pases_granos, cols_per_row=min(cols_per_row, 3))
-                # Pases disponible → futuro
                 precios_dispo = {
                     "SOJ": precio_soja if precio_soja > 0 else None,
                     "MAI": precio_maiz if precio_maiz > 0 else None,
                     "TRI": precio_trigo if precio_trigo > 0 else None,
                 }
+                _render_pases_agro(granos, precios_dispo, cols_per_row=cols_per_row)
+               
                 pases_dispo = _build_pases_disponible(granos, precios_dispo)
                 if pases_dispo:
                     st.markdown("**Disponible → Futuro**")
@@ -1168,6 +1182,103 @@ def main() -> None:
                     _render_tabla_rava("🏛️ Bonos soberanos — Top 20", bon_top)
 
     render()
+    FAMILIA_ORDEN = ["SOJ", "MAI", "TRI", "GIR", "SOR", "CEB"]
+
+def _render_pases_agro(
+    granos: list[dict],
+    precios_dispo: dict[str, float | None],
+    cols_per_row: int = 3,
+) -> None:
+    """Renderiza pases agropecuarios con layout de 2 columnas:
+    - Izquierda: Disponible → cada futuro (si hay precio disponible)
+    - Derecha: Futuros entre sí, ordenados por vencimiento
+    """
+    # Construir pases entre futuros
+    pases_fut = build_pases(granos, consecutive_only=False)
+
+    # Construir pases disponible → futuro
+    pases_dispo = _build_pases_disponible(granos, precios_dispo)
+
+    # Agrupar por familia
+    by_family_fut: dict[str, list[dict]] = defaultdict(list)
+    for p in pases_fut:
+        by_family_fut[p["family"]].append(p)
+
+    by_family_dispo: dict[str, list[dict]] = defaultdict(list)
+    for p in pases_dispo:
+        by_family_dispo[p["family"]].append(p)
+
+    # Familias presentes, en orden definido
+    familias_presentes = []
+    for fam in FAMILIA_ORDEN:
+        if fam in by_family_fut or fam in by_family_dispo:
+            familias_presentes.append(fam)
+    # Agregar familias que no estén en FAMILIA_ORDEN
+    for fam in set(list(by_family_fut.keys()) + list(by_family_dispo.keys())):
+        if fam not in familias_presentes:
+            familias_presentes.append(fam)
+
+    total = sum(len(v) for v in by_family_fut.values()) + sum(len(v) for v in by_family_dispo.values())
+    st.markdown(
+        f'<div class="section-title">🔁 Pases agropecuarios '
+        f'<span class="badge">{total}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    if not familias_presentes:
+        st.markdown(
+            '<div class="empty-card">No hay suficientes contratos con precio para armar pases todavía.</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    for fam in familias_presentes:
+        fam_name = GRAIN_NAMES.get(fam, fam)
+        dispo_items = by_family_dispo.get(fam, [])
+        fut_items = by_family_fut.get(fam, [])
+
+        # Ordenar futuros entre sí por (short_exp, long_exp)
+        fut_items.sort(key=lambda p: (p["short_symbol"], p["long_symbol"]))
+
+        st.markdown(f"### {fam_name}")
+
+        # Input de precio disponible inline (además del sidebar)
+        precio_actual = precios_dispo.get(fam) or 0.0
+        nuevo_precio = st.number_input(
+            f"Disponible {fam_name} (U$S/t)",
+            min_value=0.0,
+            value=float(precio_actual),
+            step=0.5,
+            format="%.2f",
+            key=f"dispo_inline_{fam}",
+        )
+        # Si el usuario cambió el precio inline, recalcular pases dispo para esta familia
+        if nuevo_precio != precio_actual and nuevo_precio > 0:
+            dispo_items = _build_pases_disponible(granos, {fam: nuevo_precio})
+
+        has_dispo = bool(dispo_items)
+        has_fut = bool(fut_items)
+
+        if has_dispo and has_fut:
+            col_dispo, col_fut = st.columns(2)
+        elif has_dispo:
+            col_dispo = st.container()
+            col_fut = None
+        else:
+            col_dispo = None
+            col_fut = st.container()
+
+        if has_dispo and col_dispo:
+            with col_dispo:
+                st.markdown("**Disponible → Futuro**")
+                for p in dispo_items:
+                    st.markdown(_render_pase_card(p), unsafe_allow_html=True)
+
+        if has_fut and col_fut:
+            with col_fut:
+                st.markdown("**Entre futuros**")
+                for p in fut_items:
+                    st.markdown(_render_pase_card(p), unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
