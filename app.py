@@ -488,10 +488,11 @@ def _render_pases_agro(
     granos: list[dict],
     precios_dispo: dict[str, float | None],
     cols_per_row: int = 3,
+    max_fut_pases: int = 5,
 ) -> None:
     """Layout por familia:
-    - Columna izquierda : Disponible → cada futuro (si hay precio disponible)
-    - Columna derecha   : Futuros entre sí, ordenados por vencimiento
+    - Columna izquierda : Disponible → cada futuro (precio viene de session_state)
+    - Columna derecha   : Futuros entre sí, top N por volumen combinado
     """
     pases_fut   = build_pases(granos, consecutive_only=False)
     pases_dispo = _build_pases_disponible(granos, precios_dispo)
@@ -532,15 +533,30 @@ def _render_pases_agro(
         return
 
     for fam in familias_presentes:
-        fam_name   = GRAIN_NAMES.get(fam, fam)
-        fut_items  = by_family_fut.get(fam, [])
+        fam_name  = GRAIN_NAMES.get(fam, fam)
+        fut_items = by_family_fut.get(fam, [])
 
-        # Ordenar futuros entre sí: primero por short_exp, luego por long_exp
+        # Ordenar por volumen combinado (short + long) descendente, luego tomar top N
+        def _vol_key(p):
+            rows_by_sym = {r.get("symbol", ""): r for r in granos}
+            v_s = (rows_by_sym.get(p["short_symbol"]) or {}).get("trade_volume") or 0
+            v_l = (rows_by_sym.get(p["long_symbol"])  or {}).get("trade_volume") or 0
+            return v_s + v_l
+
+        fut_items.sort(key=_vol_key, reverse=True)
+        fut_items = fut_items[:max_fut_pases]
+        # Re-ordenar los seleccionados por vencimiento para mostrarlos en orden
         fut_items.sort(key=lambda p: (p.get("short_exp", (0, 0)), p.get("long_exp", (0, 0))))
 
-        st.markdown(f"### {fam_name}")
+        # Precio disponible desde session_state (lo carga el widget de fuera del fragment)
+        precio_dispo_fam = st.session_state.get(f"dispo_{fam}", 0.0) or 0.0
+        dispo_items = (
+            _build_pases_disponible(granos, {fam: precio_dispo_fam})
+            if precio_dispo_fam > 0
+            else []
+        )
 
-        dispo_items = by_family_dispo.get(fam, [])
+        st.markdown(f"### {fam_name}")
 
         has_dispo = bool(dispo_items)
         has_fut   = bool(fut_items)
@@ -1149,15 +1165,18 @@ def main() -> None:
         cols_per_row  = st.slider("Tarjetas por fila", 2, 6, 4)
         refresh_secs  = st.slider("Refresco (seg)", 1, 10, 2)
 
-        # Precios disponibles también en sidebar (se usan como valor inicial)
-        st.divider()
-        st.subheader("🌾 Precios disponibles (BCR) — valores iniciales")
-        precio_soja  = st.number_input("Soja (U$S/t)",  min_value=0.0, value=0.0, step=0.5, format="%.2f", key="sb_soja")
-        precio_maiz  = st.number_input("Maíz (U$S/t)",  min_value=0.0, value=0.0, step=0.5, format="%.2f", key="sb_maiz")
-        precio_trigo = st.number_input("Trigo (U$S/t)", min_value=0.0, value=0.0, step=0.5, format="%.2f", key="sb_trigo")
-
     if mgr.error:
         st.stop()
+
+    # Inputs de disponible fuera del fragment
+    with st.expander("🌾 Precios disponibles (BCR)", expanded=True):
+        _c1, _c2, _c3 = st.columns(3)
+        with _c1:
+            st.number_input("Soja (U$S/t)",  min_value=0.0, value=0.0, step=0.5, format="%.2f", key="dispo_SOJ")
+        with _c2:
+            st.number_input("Maíz (U$S/t)",  min_value=0.0, value=0.0, step=0.5, format="%.2f", key="dispo_MAI")
+        with _c3:
+            st.number_input("Trigo (U$S/t)", min_value=0.0, value=0.0, step=0.5, format="%.2f", key="dispo_TRI")
 
     placeholder = st.empty()
 
@@ -1252,12 +1271,8 @@ def main() -> None:
             with tab_pgran:
                 # Los precios del sidebar son el valor inicial;
                 # el input inline dentro de _render_pases_agro permite editarlos por familia
-                precios_dispo = {
-                    "SOJ": precio_soja  if precio_soja  > 0 else None,
-                    "MAI": precio_maiz  if precio_maiz  > 0 else None,
-                    "TRI": precio_trigo if precio_trigo > 0 else None,
-                }
-                _render_pases_agro(granos, precios_dispo, cols_per_row=cols_per_row)
+                # precios_dispo no se pasan: _render_pases_agro los lee de session_state
+                _render_pases_agro(granos, {}, cols_per_row=cols_per_row)
 
             with tab_acc:
                 _render_byma_panel("Acciones BYMA", "🏢", acciones,
