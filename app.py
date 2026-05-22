@@ -1255,7 +1255,12 @@ def main() -> None:
         rows.sort(key=lambda r: sort_key(r.get("symbol", ""), r.get("category", "")))
 
         monedas = [r for r in rows if r.get("category") == "DOLAR"]
-        granos  = [r for r in rows if r.get("category") == "GRANO"]
+        granos  = [
+            r for r in rows
+            if r.get("category") == "GRANO"
+            and (r.get("trade_volume") or 0) > 0
+            and "MINI" not in r.get("symbol", "").upper()
+        ]
 
         monedas_puros = [
             r for r in monedas
