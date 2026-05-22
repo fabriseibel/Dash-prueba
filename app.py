@@ -673,7 +673,7 @@ def _render_dolares_financieros(
 
     spot = spot_pct = spot_prev = None
     if mayorista_data:
-        spot = mayorista_data.get("venta") or mayorista_data.get("compra")
+        spot = mayorista_data.get("venta")
     elif dlr_spot_row:
         spot = (dlr_spot_row.get("last_price") or dlr_spot_row.get("offer") or
                 dlr_spot_row.get("bid") or dlr_spot_row.get("prev_close") or
