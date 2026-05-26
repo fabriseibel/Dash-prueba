@@ -674,12 +674,8 @@ def _render_dolares_financieros(
     spot = spot_pct = spot_prev = None
     if mayorista_data:
         spot = mayorista_data.get("venta")
-        spot_prev = mayorista_data.get("anterior")
-        if spot and spot_prev:
-            try:
-                spot_pct = (spot - spot_prev) / spot_prev * 100
-            except Exception:
-                pass
+        spot_pct = mayorista_data.get("variacion")
+        spot_prev = (spot / (1 + spot_pct / 100)) if (spot and spot_pct) else None
 
     brecha_mep_spot = ((mep / spot - 1) * 100) if (mep and spot and spot > 0) else None
 
