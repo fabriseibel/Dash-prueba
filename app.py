@@ -1254,6 +1254,7 @@ def main() -> None:
             and "MINI" not in r.get("symbol", "").upper()
             and "DISPO" not in r.get("symbol", "").upper()
             and ".ROS/" in r.get("symbol", "").upper()
+            and r.get("symbol", "").count("/") == 1
         ]
 
         monedas_puros = [
