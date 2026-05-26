@@ -674,6 +674,7 @@ def _render_dolares_financieros(
     spot = spot_pct = spot_prev = None
     if mayorista_data:
         spot = mayorista_data.get("venta")
+        spot_prev = mayorista_data.get("anterior")
         if spot and spot_prev:
             try:
                 spot_pct = (spot - spot_prev) / spot_prev * 100
@@ -728,7 +729,7 @@ def _render_dolares_financieros(
         st.markdown(_fin_card("Dólar MEP", mep, mep_pct, mep_prev, sub_mep), unsafe_allow_html=True)
 
     with col_spot:
-        sub_spot = "DLR/SPOT · pyRofex" if spot else "DLR/SPOT · sin datos"
+        sub_spot = "dolarapi.com · mayorista" if spot else "mayorista · sin datos"
         st.markdown(_fin_card("Dólar A3500", spot, spot_pct, spot_prev, sub_spot), unsafe_allow_html=True)
 
     with col_ccl:
