@@ -241,7 +241,7 @@ def _render_card(row: dict) -> str:
     last      = row.get("last_price")
     change    = row.get("change_pct")
     volume    = row.get("trade_volume")
-    prev_close = row.get("prev_close")
+    prev_close = row.get("settlement_price")
 
     change_text, change_cls = _fmt_change(change)
     abs_change = _fmt_abs_change(last, prev_close)
@@ -674,11 +674,6 @@ def _render_dolares_financieros(
     spot = spot_pct = spot_prev = None
     if mayorista_data:
         spot = mayorista_data.get("venta")
-    elif dlr_spot_row:
-        spot = (dlr_spot_row.get("last_price") or dlr_spot_row.get("offer") or
-                dlr_spot_row.get("bid") or dlr_spot_row.get("prev_close") or
-                dlr_spot_row.get("closing_price"))
-        spot_prev = dlr_spot_row.get("prev_close") or dlr_spot_row.get("closing_price")
         if spot and spot_prev:
             try:
                 spot_pct = (spot - spot_prev) / spot_prev * 100
@@ -1254,7 +1249,7 @@ def main() -> None:
 
         rows.sort(key=lambda r: sort_key(r.get("symbol", ""), r.get("category", "")))
 
-        monedas = [r for r in rows if r.get("category") == "DOLAR"]
+        monedas = [r for r in rows if r.get("category") == "DOLAR" and (r.get("trade_volume") or 0) > 0]
         granos  = [
             r for r in rows
             if r.get("category") == "GRANO"
