@@ -1273,11 +1273,12 @@ def main() -> None:
 
         mep_rows      = mgr.get_external("MEP")
         ccl_rows      = mgr.get_external("CCL")
-        mayorista_raw = mgr.get_external("MAYORISTA")
-        mayorista_data = (
-            mayorista_raw if isinstance(mayorista_raw, dict)
-            else (mayorista_raw[0] if mayorista_raw else None)
-        )
+        try:
+            import requests as _req
+            _r = _req.get("https://dolarapi.com/v1/dolares/mayorista", timeout=5)
+            mayorista_data = _r.json() if _r.status_code == 200 else None
+        except Exception:
+            mayorista_data = None
         acciones = mgr.get_external("ACCIONES")
         bonos    = mgr.get_external("BONOS")
         cedears  = mgr.get_external("CEDEARS")
