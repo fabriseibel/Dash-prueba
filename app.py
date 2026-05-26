@@ -1249,7 +1249,7 @@ def main() -> None:
 
         rows.sort(key=lambda r: sort_key(r.get("symbol", ""), r.get("category", "")))
 
-        monedas = [r for r in rows if r.get("category") == "DOLAR" and (r.get("trade_volume") or 0) > 0]
+        monedas = [r for r in rows if r.get("category") == "DOLAR"]
         granos  = [
             r for r in rows
             if r.get("category") == "GRANO"
