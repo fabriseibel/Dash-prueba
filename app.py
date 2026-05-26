@@ -1252,6 +1252,8 @@ def main() -> None:
             if r.get("category") == "GRANO"
             and (r.get("trade_volume") or 0) > 0
             and "MINI" not in r.get("symbol", "").upper()
+            and "DISPO" not in r.get("symbol", "").upper()
+            and ".ROS/" in r.get("symbol", "").upper()
         ]
 
         monedas_puros = [
