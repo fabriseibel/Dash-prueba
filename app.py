@@ -1102,6 +1102,119 @@ def _render_tabla_rava(titulo, items, symbol_field="symbol", price_field="c",
 
 
 
+# ── fetch precios a3live.ar (MAE) ────────────────────────────────────────────
+
+def _fetch_a3live() -> dict:
+    """Snapshot de precios desde a3live.ar (MAE) via SignalR/SSE.
+    Devuelve {"agro": [...], "dollar": [...], "totals": [...]} o {} si falla.
+    Campos por item: ticker, bi, of, la, pse, se, tv, nv, variation
+    """
+    import requests, json as _json
+    try:
+        neg = requests.post(
+            "https://ws.marketdata.mae.com.ar/notifications/negotiate?negotiateVersion=1",
+            headers={"Origin": "https://a3live.ar", "User-Agent": "Mozilla/5.0"},
+            timeout=8,
+        )
+        if neg.status_code != 200:
+            return {}
+        conn_id = neg.json().get("connectionId") or neg.json().get("connectionToken")
+        if not conn_id:
+            return {}
+
+        url = f"https://ws.marketdata.mae.com.ar/notifications?id={conn_id}"
+        with requests.Session() as s:
+            s.headers.update({"Origin": "https://a3live.ar", "User-Agent": "Mozilla/5.0"})
+            resp = s.get(url, stream=True, timeout=12)
+            buffer = ""
+            for chunk in resp.iter_content(chunk_size=None):
+                buffer += chunk.decode("utf-8", errors="ignore")
+                if '"target":"Snapshot"' in buffer:
+                    start = buffer.find('{"type":1,"target":"Snapshot"')
+                    if start >= 0:
+                        raw = buffer[start:].split("\n")[0].strip()
+                        data = _json.loads(raw)
+                        return data["arguments"][0]["data"]
+                    break
+                if len(buffer) > 100_000:
+                    break
+        return {}
+    except Exception:
+        return {}
+
+
+def _a3live_to_rows(a3data: dict) -> tuple[list[dict], list[dict]]:
+    """Convierte snapshot a3live al formato de filas del dashboard.
+    Devuelve (monedas, granos) como listas de dicts compatibles con _render_card.
+    """
+    from datetime import date as _date
+
+    MONTHS_MAP = {
+        "ENE": 1, "FEB": 2, "MAR": 3, "ABR": 4, "MAY": 5, "JUN": 6,
+        "JUL": 7, "AGO": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DIC": 12,
+    }
+
+    def _parse_exp(ticker: str) -> tuple[int, int] | None:
+        """Extrae (año, mes) de ticker tipo SOJ.ROS/SEP26 o DLR/AGO26."""
+        try:
+            part = ticker.split("/")[-1]  # SEP26, AGO26, etc.
+            mes_str = part[:3].upper()
+            anio = 2000 + int(part[3:])
+            mes = MONTHS_MAP.get(mes_str)
+            if mes:
+                return (anio, mes)
+        except Exception:
+            pass
+        return None
+
+    monedas, granos = [], []
+    today = _date.today()
+
+    for item in a3data.get("dollar", []):
+        la   = item.get("la") or None
+        pse  = item.get("pse") or None
+        se   = item.get("se") or None
+        tv   = item.get("tv") or 0
+        var  = item.get("variation")
+        row = {
+            "symbol":           item["ticker"],
+            "category":         "DOLAR",
+            "last_price":       la if la and la > 0 else None,
+            "prev_close":       pse,
+            "settlement_price": se if se and se > 0 else pse,
+            "trade_volume":     int(tv) if tv else 0,
+            "change_pct":       var,
+            "bid":              item.get("bi"),
+            "offer":            item.get("of"),
+            "underlying":       "DLR",
+        }
+        monedas.append(row)
+
+    for item in a3data.get("agro", []):
+        la   = item.get("la") or None
+        pse  = item.get("pse") or None
+        se   = item.get("se") or None
+        tv   = item.get("tv") or 0
+        var  = item.get("variation")
+        ticker = item["ticker"]
+        # familia: SOJ.ROS/SEP26 → SOJ
+        familia = ticker.split(".")[0] if "." in ticker else ticker.split("/")[0]
+        row = {
+            "symbol":           ticker,
+            "category":         "GRANO",
+            "last_price":       la if la and la > 0 else None,
+            "prev_close":       pse,
+            "settlement_price": se if se and se > 0 else pse,
+            "trade_volume":     int(tv) if tv else 0,
+            "change_pct":       var,
+            "bid":              item.get("bi"),
+            "offer":            item.get("of"),
+            "underlying":       familia,
+        }
+        granos.append(row)
+
+    return monedas, granos
+
 # ── scraping precios pizarra BCR ─────────────────────────────────────────────
 
 def _fetch_bcr_pizarra() -> dict[str, float]:
@@ -1233,6 +1346,15 @@ def main() -> None:
         st.session_state["bcr_loaded"] = True
         st.session_state["bcr_precios"] = bcr
 
+    # Cargar snapshot a3live al inicio y refrescar cada 30 seg
+    _now_ts = datetime.now(BA_TZ).timestamp()
+    if "a3live_ts" not in st.session_state or (_now_ts - st.session_state.get("a3live_ts", 0)) > 30:
+        with st.spinner("Cargando precios MAE (a3live.ar)..."):
+            _a3 = _fetch_a3live()
+        if _a3:
+            st.session_state["a3live_data"] = _a3
+        st.session_state["a3live_ts"] = _now_ts
+
     bcr_ok = bool(st.session_state.get("bcr_precios"))
     bcr_caption = "✅ Precargado desde cac.bcr.com.ar · editá si querés ajustar" if bcr_ok else "⚠️ No se pudo cargar BCR · ingresá manualmente"
 
@@ -1289,16 +1411,38 @@ def main() -> None:
             None,
         )
 
-        mep_rows      = mgr.get_external("MEP")
-        ccl_rows      = mgr.get_external("CCL")
-        mayorista_raw = mgr.get_external("MAYORISTA")
-        mayorista_data = (
-            mayorista_raw if isinstance(mayorista_raw, dict)
-            else (mayorista_raw[0] if mayorista_raw else None)
-        )
+        mep_rows = mgr.get_external("MEP")
+        ccl_rows = mgr.get_external("CCL")
         acciones = mgr.get_external("ACCIONES")
         bonos    = mgr.get_external("BONOS")
         cedears  = mgr.get_external("CEDEARS")
+
+        # ── Snapshot a3live.ar (fuente principal: agro + dollar + A3500) ──
+        a3data = st.session_state.get("a3live_data", {})
+        a3_monedas, a3_granos = _a3live_to_rows(a3data)
+
+        # Mayorista: desde totals de a3live (BCRACOM3500) o fallback dolarapi
+        a3_totals = {t["id"]: t for t in a3data.get("totals", [])}
+        bcra = a3_totals.get("BCRACOM3500")
+        if bcra and bcra.get("value"):
+            mayorista_data = {"venta": bcra["value"], "variacion": bcra.get("variation", 0)}
+        else:
+            try:
+                import requests as _req
+                _r = _req.get("https://dolarapi.com/v1/dolares/mayorista", timeout=5)
+                mayorista_data = _r.json() if _r.status_code == 200 else None
+            except Exception:
+                mayorista_data = None
+
+        # Usar datos a3live si están disponibles, sino pyRofex
+        if a3_monedas:
+            monedas_puros = [
+                r for r in a3_monedas
+                if not r["symbol"].endswith("/SPOT")
+                and not r["symbol"].endswith("/DISPO")
+            ]
+        if a3_granos:
+            granos = a3_granos
 
         pases_monedas = build_pases(monedas_puros, consecutive_only=True)
         pases_granos  = build_pases(granos, consecutive_only=False, agro_dates=True)
