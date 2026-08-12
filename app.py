@@ -1389,129 +1389,103 @@ def main() -> None:
         with _c3:
             st.number_input("Trigo (U$S/t)", min_value=0.0, value=float(st.session_state.get("dispo_TRI", 0.0)), step=0.5, format="%.2f", key="dispo_TRI")
 
-    placeholder = st.empty()
-
     @st.fragment(run_every=refresh_secs)
     def render():
-        try:
-            # ── Fuente principal: a3live.ar ──────────────────────────────────
-            a3data = st.session_state.get("a3live_data", {})
-            a3_monedas, a3_granos = _a3live_to_rows(a3data)
+        # ── Fuente principal: a3live.ar ──────────────────────────────
+        a3data = st.session_state.get("a3live_data", {})
+        a3_monedas, a3_granos = _a3live_to_rows(a3data)
 
-            # Fallback pyRofex si a3live no trajo datos
-            if not a3_monedas and not a3_granos:
-                try:
-                    rows = mgr.snapshot()
-                    rows = [r for r in rows if keep_for_dashboard(
-                        r.get("symbol", ""),
-                        max_spread_gap=max_pase,
-                        hide_options=ocultar_opciones,
-                        hide_mayorista=ocultar_mayorista,
-                    )]
-                    rows.sort(key=lambda r: sort_key(r.get("symbol", ""), r.get("category", "")))
-                    monedas_puros = [
-                        r for r in rows if r.get("category") == "DOLAR"
-                        and (info := parse_symbol(r.get("symbol", "")))
-                        and not info.is_spread and not info.is_dispo
-                        and "SPOT" not in r.get("symbol", "").upper()
-                    ]
-                    granos = [r for r in rows if r.get("category") == "GRANO"]
-                except Exception:
-                    monedas_puros, granos = [], []
-            else:
-                monedas_puros = [
-                    r for r in a3_monedas
-                    if not r["symbol"].endswith("/SPOT")
-                    and not r["symbol"].endswith("/DISPO")
-                ]
-                granos = a3_granos
-
-            # Mayorista: totals a3live → dolarapi fallback
-            a3_totals = {t["id"]: t for t in a3data.get("totals", [])}
-            bcra = a3_totals.get("BCRACOM3500")
-            if bcra and bcra.get("value"):
-                mayorista_data = {"venta": bcra["value"], "variacion": bcra.get("variation", 0)}
-            else:
-                try:
-                    import requests as _req
-                    _r = _req.get("https://dolarapi.com/v1/dolares/mayorista", timeout=5)
-                    mayorista_data = _r.json() if _r.status_code == 200 else None
-                except Exception:
-                    mayorista_data = None
-
-            # Externos (bonos para MEP/CCL, acciones, CEDEARs)
+        if a3_monedas:
+            monedas_puros = [
+                r for r in a3_monedas
+                if not r["symbol"].endswith("/SPOT")
+                and not r["symbol"].endswith("/DISPO")
+            ]
+        else:
+            # Fallback pyRofex
             try:
-                mep_rows = mgr.get_external("MEP")
-                ccl_rows = mgr.get_external("CCL")
-                acciones = mgr.get_external("ACCIONES")
-                bonos    = mgr.get_external("BONOS")
-                cedears  = mgr.get_external("CEDEARS")
+                rows = mgr.snapshot()
+                rows = [r for r in rows if keep_for_dashboard(
+                    r.get("symbol", ""), max_spread_gap=max_pase,
+                    hide_options=ocultar_opciones, hide_mayorista=ocultar_mayorista,
+                )]
+                monedas_puros = [
+                    r for r in rows if r.get("category") == "DOLAR"
+                    and (info := parse_symbol(r.get("symbol", "")))
+                    and not info.is_spread and not info.is_dispo
+                    and "SPOT" not in r.get("symbol", "").upper()
+                ]
             except Exception:
-                mep_rows = ccl_rows = acciones = bonos = cedears = []
+                monedas_puros = []
 
-            dlr_spot_row = None
+        granos = a3_granos if a3_granos else []
 
-            pases_monedas = build_pases(monedas_puros, consecutive_only=True)
-            pases_granos  = build_pases(granos, consecutive_only=False, agro_dates=True)
+        # Mayorista A3500
+        a3_totals = {t["id"]: t for t in a3data.get("totals", [])}
+        bcra = a3_totals.get("BCRACOM3500")
+        if bcra and bcra.get("value"):
+            mayorista_data = {"venta": bcra["value"], "variacion": bcra.get("variation", 0)}
+        else:
+            try:
+                import requests as _req
+                _r = _req.get("https://dolarapi.com/v1/dolares/mayorista", timeout=5)
+                mayorista_data = _r.json() if _r.status_code == 200 else None
+            except Exception:
+                mayorista_data = None
 
-        except Exception as _e:
-            st.error(f"Error en render(): {_e}")
-            import traceback
-            st.code(traceback.format_exc())
-            return
+        # Externos: bonos (MEP/CCL), acciones, CEDEARs
+        try:
+            mep_rows = mgr.get_external("MEP")
+            ccl_rows = mgr.get_external("CCL")
+            acciones = mgr.get_external("ACCIONES")
+            bonos    = mgr.get_external("BONOS")
+            cedears  = mgr.get_external("CEDEARS")
+        except Exception:
+            mep_rows = ccl_rows = acciones = bonos = cedears = []
 
-        with placeholder.container():
-            now_ba = datetime.now(BA_TZ).strftime("%H:%M:%S")
-            st.caption(
-                f"Actualizado: {now_ba} (Buenos Aires) · "
-                f"Refresco automático cada {refresh_secs}s"
-            )
+        pases_monedas = build_pases(monedas_puros, consecutive_only=True)
+        pases_granos  = build_pases(granos, consecutive_only=False, agro_dates=True)
 
-            _render_dolares_financieros(mep_rows, ccl_rows, bonos, dlr_spot_row, mayorista_data)
-            st.divider()
+        now_ba = datetime.now(BA_TZ).strftime("%H:%M:%S")
+        fuente = "a3live.ar" if a3_monedas else "pyRofex (fallback)"
+        st.caption(f"Actualizado: {now_ba} (Buenos Aires) · Fuente: {fuente} · Refresco cada {refresh_secs}s")
 
-            (
-                tab_monedas, tab_pmon, tab_granos, tab_pdispo, tab_pfut,
-                tab_acc, tab_bon, tab_ced,
-            ) = st.tabs([
-                f"💵 Monedas ({len(monedas_puros)})",
-                f"🔁 Pases monedas ({len(pases_monedas)})",
-                f"🌾 Granos ({len(granos)})",
-                "📦 Pases disponible",
-                f"🔁 Pases futuros ({len(pases_granos)})",
-                f"🏢 Acciones ({len(acciones)})",
-                f"🏛️ Bonos ({len(bonos)})",
-                f"🍎 CEDEARs ({len(cedears)})",
-            ])
+        _render_dolares_financieros(mep_rows, ccl_rows, bonos, None, mayorista_data)
+        st.divider()
 
-            with tab_monedas:
-                _render_group("Monedas", "💵", monedas_puros, cols_per_row=cols_per_row)
+        (
+            tab_monedas, tab_pmon, tab_granos, tab_pdispo, tab_pfut,
+            tab_acc, tab_bon, tab_ced,
+        ) = st.tabs([
+            f"💵 Monedas ({len(monedas_puros)})",
+            f"🔁 Pases monedas ({len(pases_monedas)})",
+            f"🌾 Granos ({len(granos)})",
+            "📦 Pases disponible",
+            f"🔁 Pases futuros ({len(pases_granos)})",
+            f"🏢 Acciones ({len(acciones)})",
+            f"🏛️ Bonos ({len(bonos)})",
+            f"🍎 CEDEARs ({len(cedears)})",
+        ])
 
-            with tab_pmon:
-                _render_pases(pases_monedas, cols_per_row=min(cols_per_row, 3))
-
-            with tab_granos:
-                _render_group("Granos", "🌾", granos, cols_per_row=cols_per_row)
-
-            with tab_pdispo:
-                _render_pases_dispo(granos, cols_per_row=cols_per_row)
-
-            with tab_pfut:
-                _render_pases_fut_fut(granos, cols_per_row=cols_per_row)
-
-            with tab_acc:
-                _render_byma_panel("Acciones BYMA", "🏢", acciones,
-                                   cols_per_row=cols_per_row, buscar=buscar)
-
-            with tab_bon:
-                _render_byma_panel("Bonos soberanos", "🏛️", bonos,
-                                   cols_per_row=cols_per_row, buscar=buscar)
-
-            with tab_ced:
-                _render_byma_panel("CEDEARs", "🍎", cedears,
-                                   cols_per_row=cols_per_row, buscar=buscar)
-
-
+        with tab_monedas:
+            _render_group("Monedas", "💵", monedas_puros, cols_per_row=cols_per_row)
+        with tab_pmon:
+            _render_pases(pases_monedas, cols_per_row=min(cols_per_row, 3))
+        with tab_granos:
+            _render_group("Granos", "🌾", granos, cols_per_row=cols_per_row)
+        with tab_pdispo:
+            _render_pases_dispo(granos, cols_per_row=cols_per_row)
+        with tab_pfut:
+            _render_pases_fut_fut(granos, cols_per_row=cols_per_row)
+        with tab_acc:
+            _render_byma_panel("Acciones BYMA", "🏢", acciones,
+                               cols_per_row=cols_per_row, buscar=buscar)
+        with tab_bon:
+            _render_byma_panel("Bonos soberanos", "🏛️", bonos,
+                               cols_per_row=cols_per_row, buscar=buscar)
+        with tab_ced:
+            _render_byma_panel("CEDEARs", "🍎", cedears,
+                               cols_per_row=cols_per_row, buscar=buscar)
 
     render()
 
