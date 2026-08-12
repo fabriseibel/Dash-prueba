@@ -238,10 +238,10 @@ def _fmt_abs_change(last, prev) -> str:
 
 def _render_card(row: dict) -> str:
     symbol    = display_symbol(row.get("symbol", "—"))
-    last      = row.get("last_price")
+    last      = row.get("last_price") or row.get("settlement_price") or row.get("prev_close")
     change    = row.get("change_pct")
     volume    = row.get("trade_volume")
-    prev_close = row.get("prev_close")
+    prev_close = row.get("settlement_price") or row.get("prev_close")
 
     change_text, change_cls = _fmt_change(change)
     abs_change = _fmt_abs_change(last, prev_close)
@@ -692,6 +692,8 @@ def _render_dolares_financieros(
     spot = spot_pct = spot_prev = None
     if mayorista_data:
         spot = mayorista_data.get("venta") or mayorista_data.get("compra")
+        spot_pct = mayorista_data.get("variacion")
+        spot_prev = (spot / (1 + spot_pct / 100)) if (spot and spot_pct) else None
     elif dlr_spot_row:
         spot = (dlr_spot_row.get("last_price") or dlr_spot_row.get("offer") or
                 dlr_spot_row.get("bid") or dlr_spot_row.get("prev_close") or
@@ -751,7 +753,7 @@ def _render_dolares_financieros(
         st.markdown(_fin_card("Dólar MEP", mep, mep_pct, mep_prev, sub_mep), unsafe_allow_html=True)
 
     with col_spot:
-        sub_spot = "DLR/SPOT · pyRofex" if spot else "DLR/SPOT · sin datos"
+        sub_spot = "BCRACOM3500 · a3live.ar" if spot else "A3500 · sin datos"
         st.markdown(_fin_card("Dólar A3500", spot, spot_pct, spot_prev, sub_spot), unsafe_allow_html=True)
 
     with col_ccl:
@@ -1132,9 +1134,13 @@ def _fetch_a3live() -> dict:
                 if '"target":"Snapshot"' in buffer:
                     start = buffer.find('{"type":1,"target":"Snapshot"')
                     if start >= 0:
-                        raw = buffer[start:].split("\n")[0].strip()
-                        data = _json.loads(raw)
-                        return data["arguments"][0]["data"]
+                        # SignalR usa \x1e como separador de mensajes
+                        raw = buffer[start:].split("\x1e")[0].split("\n")[0].strip()
+                        try:
+                            data = _json.loads(raw)
+                            return data["arguments"][0]["data"]
+                        except Exception:
+                            pass
                     break
                 if len(buffer) > 100_000:
                     break
@@ -1256,8 +1262,8 @@ def _fetch_bcr_pizarra() -> dict[str, float]:
 
 def main() -> None:
     st.markdown(CARD_CSS, unsafe_allow_html=True)
-    st.title("Matba Rofex — Dashboard en tiempo real")
-    st.caption("Dólares y granos · WebSocket pyRofex · persistencia en Supabase")
+    st.title("Dashboard de Mercados — Tiempo Real")
+    st.caption("Fuente: a3live.ar (MAE) · Dólares y granos · Supabase")
 
     mgr = get_manager()
 
@@ -1335,7 +1341,7 @@ def main() -> None:
         refresh_secs  = st.slider("Refresco (seg)", 1, 10, 2)
 
     if mgr.error:
-        st.warning(f"⚠️ Sin conexión a Rofex: {mgr.error} — usando datos de a3live.ar")
+        st.stop()
 
     # Cargar precios BCR automáticamente al inicio de la sesión
     if "bcr_loaded" not in st.session_state:
@@ -1459,7 +1465,7 @@ def main() -> None:
 
             (
                 tab_monedas, tab_pmon, tab_granos, tab_pdispo, tab_pfut,
-                tab_acc, tab_bon, tab_ced, tab_heat, tab_tabla,
+                tab_acc, tab_bon, tab_ced,
             ) = st.tabs([
                 f"💵 Monedas ({len(monedas_puros)})",
                 f"🔁 Pases monedas ({len(pases_monedas)})",
@@ -1469,8 +1475,6 @@ def main() -> None:
                 f"🏢 Acciones ({len(acciones)})",
                 f"🏛️ Bonos ({len(bonos)})",
                 f"🍎 CEDEARs ({len(cedears)})",
-                "🗺️ Mapa de Calor BYMA",
-                "📊 Mi Tabla",
             ])
 
             with tab_monedas:
@@ -1500,26 +1504,7 @@ def main() -> None:
                 _render_byma_panel("CEDEARs", "🍎", cedears,
                                    cols_per_row=cols_per_row, buscar=buscar)
 
-            with tab_heat:
-                _render_heatmap(acciones)
 
-            with tab_tabla:
-                st.markdown("### 📊 Mi Tabla")
-                col1, col2 = st.columns(2)
-                with col1:
-                    acc_top = sorted(
-                        acciones,
-                        key=lambda x: float(x.get("c") or 0) * float(x.get("v") or 0),
-                        reverse=True,
-                    )[:20]
-                    _render_tabla_rava("🏢 Acciones — Top 20 por monto", acc_top)
-                with col2:
-                    bon_top = sorted(
-                        bonos,
-                        key=lambda x: float(x.get("c") or 0) * float(x.get("v") or 0),
-                        reverse=True,
-                    )[:20]
-                    _render_tabla_rava("🏛️ Bonos soberanos — Top 20", bon_top)
 
     render()
 
