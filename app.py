@@ -1418,7 +1418,25 @@ def main() -> None:
             except Exception:
                 monedas_puros = []
 
-        granos = a3_granos if a3_granos else []
+        if a3_granos:
+            granos = a3_granos
+        else:
+            try:
+                rows = mgr.snapshot()
+                rows = [r for r in rows if keep_for_dashboard(
+                    r.get("symbol", ""), max_spread_gap=max_pase,
+                    hide_options=ocultar_opciones, hide_mayorista=ocultar_mayorista,
+                )]
+                granos = [
+                    r for r in rows if r.get("category") == "GRANO"
+                    and (r.get("trade_volume") or 0) > 0
+                    and "MINI" not in r.get("symbol", "").upper()
+                    and "DISPO" not in r.get("symbol", "").upper()
+                    and ".ROS/" in r.get("symbol", "").upper()
+                    and r.get("symbol", "").count("/") == 1
+                ]
+            except Exception:
+                granos = []
 
         # Mayorista A3500
         a3_totals = {t["id"]: t for t in a3data.get("totals", [])}
@@ -1443,6 +1461,15 @@ def main() -> None:
         except Exception:
             mep_rows = ccl_rows = acciones = bonos = cedears = []
 
+        MONTHS_ORD = {"ENE":1,"FEB":2,"MAR":3,"ABR":4,"MAY":5,"JUN":6,
+                      "JUL":7,"AGO":8,"SEP":9,"OCT":10,"NOV":11,"DIC":12}
+        def _exp_sort(r):
+            try:
+                part = r["symbol"].split("/")[-1]
+                return (2000 + int(part[3:]), MONTHS_ORD.get(part[:3].upper(), 0))
+            except Exception:
+                return (9999, 0)
+        monedas_puros.sort(key=_exp_sort)
         pases_monedas = build_pases(monedas_puros, consecutive_only=True)
         pases_granos  = build_pases(granos, consecutive_only=False, agro_dates=True)
 
