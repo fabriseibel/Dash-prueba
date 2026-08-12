@@ -1335,7 +1335,7 @@ def main() -> None:
         refresh_secs  = st.slider("Refresco (seg)", 1, 10, 2)
 
     if mgr.error:
-        st.stop()
+        st.warning(f"⚠️ Sin conexión a Rofex: {mgr.error} — usando datos de a3live.ar")
 
     # Cargar precios BCR automáticamente al inicio de la sesión
     if "bcr_loaded" not in st.session_state:
