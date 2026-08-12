@@ -1109,40 +1109,41 @@ def _render_tabla_rava(titulo, items, symbol_field="symbol", price_field="c",
 def _fetch_a3live() -> dict:
     """Snapshot de precios desde a3live.ar (MAE) via SignalR/SSE.
     Devuelve {"agro": [...], "dollar": [...], "totals": [...]} o {} si falla.
-    Campos por item: ticker, bi, of, la, pse, se, tv, nv, variation
     """
     import requests, json as _json
+    HEADERS = {"Origin": "https://a3live.ar", "User-Agent": "Mozilla/5.0"}
     try:
+        # 1. Negotiate
         neg = requests.post(
             "https://ws.marketdata.mae.com.ar/notifications/negotiate?negotiateVersion=1",
-            headers={"Origin": "https://a3live.ar", "User-Agent": "Mozilla/5.0"},
-            timeout=8,
+            headers=HEADERS, timeout=6,
         )
         if neg.status_code != 200:
             return {}
-        conn_id = neg.json().get("connectionId") or neg.json().get("connectionToken")
+        neg_data = neg.json()
+        conn_id = neg_data.get("connectionId") or neg_data.get("connectionToken")
         if not conn_id:
             return {}
 
+        # 2. Conectar SSE y esperar Snapshot
         url = f"https://ws.marketdata.mae.com.ar/notifications?id={conn_id}"
-        with requests.Session() as s:
-            s.headers.update({"Origin": "https://a3live.ar", "User-Agent": "Mozilla/5.0"})
-            resp = s.get(url, stream=True, timeout=12)
-            buffer = ""
-            for chunk in resp.iter_content(chunk_size=None):
-                buffer += chunk.decode("utf-8", errors="ignore")
-                if '"target":"Snapshot"' in buffer:
-                    start = buffer.find('{"type":1,"target":"Snapshot"')
-                    if start >= 0:
-                        # SignalR usa \x1e como separador de mensajes
-                        raw = buffer[start:].split("\x1e")[0].split("\n")[0].strip()
-                        try:
-                            data = _json.loads(raw)
-                            return data["arguments"][0]["data"]
-                        except Exception:
-                            pass
+        buffer = b""
+        with requests.get(url, headers=HEADERS, stream=True, timeout=10) as resp:
+            for chunk in resp.iter_content(chunk_size=4096):
+                buffer += chunk
+                text = buffer.decode("utf-8", errors="ignore")
+                if '"target":"Snapshot"' in text:
+                    # SignalR: mensajes separados por \x1e
+                    for part in text.replace("\x1e", "\n").split("\n"):
+                        part = part.strip()
+                        if part.startswith('{"type":1') and '"target":"Snapshot"' in part:
+                            try:
+                                data = _json.loads(part)
+                                return data["arguments"][0]["data"]
+                            except Exception:
+                                continue
                     break
-                if len(buffer) > 100_000:
+                if len(buffer) > 200_000:
                     break
         return {}
     except Exception:
@@ -1352,14 +1353,27 @@ def main() -> None:
         st.session_state["bcr_loaded"] = True
         st.session_state["bcr_precios"] = bcr
 
-    # Cargar snapshot a3live al inicio y refrescar cada 30 seg
+    # Cargar snapshot a3live en background (no bloquea la UI)
     _now_ts = datetime.now(BA_TZ).timestamp()
     if "a3live_ts" not in st.session_state or (_now_ts - st.session_state.get("a3live_ts", 0)) > 30:
-        with st.spinner("Cargando precios MAE (a3live.ar)..."):
-            _a3 = _fetch_a3live()
-        if _a3:
-            st.session_state["a3live_data"] = _a3
-        st.session_state["a3live_ts"] = _now_ts
+        import threading
+        def _bg_fetch():
+            try:
+                _a3 = _fetch_a3live()
+                if _a3:
+                    st.session_state["a3live_data"] = _a3
+            except Exception:
+                pass
+            st.session_state["a3live_ts"] = datetime.now(BA_TZ).timestamp()
+        # Solo lanzar si no hay un fetch en curso
+        if not st.session_state.get("a3live_fetching"):
+            st.session_state["a3live_fetching"] = True
+            t = threading.Thread(target=_bg_fetch, daemon=True)
+            t.start()
+            # Si es la primera vez, esperar brevemente para tener datos
+            if "a3live_data" not in st.session_state:
+                t.join(timeout=8)
+            st.session_state["a3live_fetching"] = False
 
     bcr_ok = bool(st.session_state.get("bcr_precios"))
     bcr_caption = "✅ Precargado desde cac.bcr.com.ar · editá si querés ajustar" if bcr_ok else "⚠️ No se pudo cargar BCR · ingresá manualmente"
@@ -1379,79 +1393,72 @@ def main() -> None:
 
     @st.fragment(run_every=refresh_secs)
     def render():
-        rows = mgr.snapshot()
+        try:
+            # ── Fuente principal: a3live.ar ──────────────────────────────────
+            a3data = st.session_state.get("a3live_data", {})
+            a3_monedas, a3_granos = _a3live_to_rows(a3data)
 
-        if underlying_filter:
-            rows = [r for r in rows if r.get("underlying") in underlying_filter]
+            # Fallback pyRofex si a3live no trajo datos
+            if not a3_monedas and not a3_granos:
+                try:
+                    rows = mgr.snapshot()
+                    rows = [r for r in rows if keep_for_dashboard(
+                        r.get("symbol", ""),
+                        max_spread_gap=max_pase,
+                        hide_options=ocultar_opciones,
+                        hide_mayorista=ocultar_mayorista,
+                    )]
+                    rows.sort(key=lambda r: sort_key(r.get("symbol", ""), r.get("category", "")))
+                    monedas_puros = [
+                        r for r in rows if r.get("category") == "DOLAR"
+                        and (info := parse_symbol(r.get("symbol", "")))
+                        and not info.is_spread and not info.is_dispo
+                        and "SPOT" not in r.get("symbol", "").upper()
+                    ]
+                    granos = [r for r in rows if r.get("category") == "GRANO"]
+                except Exception:
+                    monedas_puros, granos = [], []
+            else:
+                monedas_puros = [
+                    r for r in a3_monedas
+                    if not r["symbol"].endswith("/SPOT")
+                    and not r["symbol"].endswith("/DISPO")
+                ]
+                granos = a3_granos
 
-        rows = [
-            r for r in rows
-            if keep_for_dashboard(
-                r.get("symbol", ""),
-                max_spread_gap=max_pase,
-                hide_options=ocultar_opciones,
-                hide_mayorista=ocultar_mayorista,
-            )
-        ]
+            # Mayorista: totals a3live → dolarapi fallback
+            a3_totals = {t["id"]: t for t in a3data.get("totals", [])}
+            bcra = a3_totals.get("BCRACOM3500")
+            if bcra and bcra.get("value"):
+                mayorista_data = {"venta": bcra["value"], "variacion": bcra.get("variation", 0)}
+            else:
+                try:
+                    import requests as _req
+                    _r = _req.get("https://dolarapi.com/v1/dolares/mayorista", timeout=5)
+                    mayorista_data = _r.json() if _r.status_code == 200 else None
+                except Exception:
+                    mayorista_data = None
 
-        if buscar:
-            q = buscar.strip().upper()
-            rows = [r for r in rows if q in r.get("symbol", "").upper()]
-
-        rows.sort(key=lambda r: sort_key(r.get("symbol", ""), r.get("category", "")))
-
-        monedas = [r for r in rows if r.get("category") == "DOLAR"]
-        granos  = [r for r in rows if r.get("category") == "GRANO"]
-
-        monedas_puros = [
-            r for r in monedas
-            if (info := parse_symbol(r.get("symbol", "")))
-            and not info.is_spread
-            and not info.is_dispo
-            and "SPOT" not in r.get("symbol", "").upper()
-        ]
-
-        _all_rows    = mgr.snapshot()
-        dlr_spot_row = next(
-            (r for r in _all_rows if r.get("symbol", "").upper() in ("DLR/SPOT", "DLR/DISPO")),
-            None,
-        )
-
-        mep_rows = mgr.get_external("MEP")
-        ccl_rows = mgr.get_external("CCL")
-        acciones = mgr.get_external("ACCIONES")
-        bonos    = mgr.get_external("BONOS")
-        cedears  = mgr.get_external("CEDEARS")
-
-        # ── Snapshot a3live.ar (fuente principal: agro + dollar + A3500) ──
-        a3data = st.session_state.get("a3live_data", {})
-        a3_monedas, a3_granos = _a3live_to_rows(a3data)
-
-        # Mayorista: desde totals de a3live (BCRACOM3500) o fallback dolarapi
-        a3_totals = {t["id"]: t for t in a3data.get("totals", [])}
-        bcra = a3_totals.get("BCRACOM3500")
-        if bcra and bcra.get("value"):
-            mayorista_data = {"venta": bcra["value"], "variacion": bcra.get("variation", 0)}
-        else:
+            # Externos (bonos para MEP/CCL, acciones, CEDEARs)
             try:
-                import requests as _req
-                _r = _req.get("https://dolarapi.com/v1/dolares/mayorista", timeout=5)
-                mayorista_data = _r.json() if _r.status_code == 200 else None
+                mep_rows = mgr.get_external("MEP")
+                ccl_rows = mgr.get_external("CCL")
+                acciones = mgr.get_external("ACCIONES")
+                bonos    = mgr.get_external("BONOS")
+                cedears  = mgr.get_external("CEDEARS")
             except Exception:
-                mayorista_data = None
+                mep_rows = ccl_rows = acciones = bonos = cedears = []
 
-        # Usar datos a3live si están disponibles, sino pyRofex
-        if a3_monedas:
-            monedas_puros = [
-                r for r in a3_monedas
-                if not r["symbol"].endswith("/SPOT")
-                and not r["symbol"].endswith("/DISPO")
-            ]
-        if a3_granos:
-            granos = a3_granos
+            dlr_spot_row = None
 
-        pases_monedas = build_pases(monedas_puros, consecutive_only=True)
-        pases_granos  = build_pases(granos, consecutive_only=False, agro_dates=True)
+            pases_monedas = build_pases(monedas_puros, consecutive_only=True)
+            pases_granos  = build_pases(granos, consecutive_only=False, agro_dates=True)
+
+        except Exception as _e:
+            st.error(f"Error en render(): {_e}")
+            import traceback
+            st.code(traceback.format_exc())
+            return
 
         with placeholder.container():
             now_ba = datetime.now(BA_TZ).strftime("%H:%M:%S")
