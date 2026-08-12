@@ -1430,9 +1430,9 @@ def main() -> None:
                 granos = [
                     r for r in rows if r.get("category") == "GRANO"
                     and (r.get("trade_volume") or 0) > 0
-                    and ".MIN/" not in r.get("symbol", "").upper()
-                    and "/MIN" not in r.get("symbol", "").upper()
                     and ".MIN" not in r.get("symbol", "").upper()
+                    and ".ROS/" in r.get("symbol", "").upper()
+                    and r.get("symbol", "").count("/") == 1
                     and "DISPO" not in r.get("symbol", "").upper()
                     and r.get("symbol", "").count("/") == 1
                 ]
