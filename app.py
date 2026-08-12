@@ -241,7 +241,7 @@ def _render_card(row: dict) -> str:
     last      = row.get("last_price")
     change    = row.get("change_pct")
     volume    = row.get("trade_volume")
-    prev_close = row.get("settlement_price")
+    prev_close = row.get("prev_close")
 
     change_text, change_cls = _fmt_change(change)
     abs_change = _fmt_abs_change(last, prev_close)
@@ -269,14 +269,44 @@ def _exp_label(exp: tuple[int, int]) -> str:
     return f"{MONTHS_SHORT.get(m, '?')}{str(y)[-2:]}"
 
 
+def _last_trading_days_of_month(y: int, m: int) -> list:
+    """Días hábiles (lun-vie) del mes, descontando feriados fijos argentinos."""
+    FERIADOS_AR = {
+        date(y, 1, 1), date(y, 3, 24), date(y, 4, 2), date(y, 5, 1),
+        date(y, 5, 25), date(y, 7, 9), date(y, 12, 8), date(y, 12, 25),
+    }
+    dias = []
+    for d in range(1, monthrange(y, m)[1] + 1):
+        day = date(y, m, d)
+        if day.weekday() < 5 and day not in FERIADOS_AR:
+            dias.append(day)
+    return dias
+
+
 def _exp_to_date(exp: tuple[int, int]) -> date:
+    """Vencimiento genérico: último día calendario del mes (monedas)."""
     y, m = exp
     return date(y, m, monthrange(y, m)[1])
 
 
+def _exp_to_date_agro(exp: tuple[int, int]) -> date:
+    """Vencimiento real agropecuario Matba Rofex:
+    última rueda previa a las últimas 5 ruedas del mes de entrega
+    = 6ta última rueda hábil del mes.
+    """
+    y, m = exp
+    ruedas = _last_trading_days_of_month(y, m)
+    if len(ruedas) >= 6:
+        return ruedas[-6]
+    elif ruedas:
+        return ruedas[0]
+    return date(y, m, 1)
+
+
+
 # ── construcción de pases ────────────────────────────────────────────────────
 
-def build_pases(rows: list[dict], consecutive_only: bool = True) -> list[dict]:
+def build_pases(rows: list[dict], consecutive_only: bool = True, agro_dates: bool = False) -> list[dict]:
     families: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
         symbol = r.get("symbol", "")
@@ -319,8 +349,8 @@ def build_pases(rows: list[dict], consecutive_only: bool = True) -> list[dict]:
             if not p_s or not p_l:
                 continue
             spread = p_l - p_s
-            d_short = _exp_to_date(short["expiration"])
-            d_long  = _exp_to_date(long["expiration"])
+            d_short = _exp_to_date_agro(short["expiration"]) if agro_dates else _exp_to_date(short["expiration"])
+            d_long  = _exp_to_date_agro(long["expiration"]) if agro_dates else _exp_to_date(long["expiration"])
             days = (d_long - d_short).days
             tna = None
             if days > 0 and p_s > 0:
@@ -372,7 +402,7 @@ def _build_pases_disponible(granos: list[dict], precios_dispo: dict) -> list[dic
         for fut in futuros:
             p_fut  = fut["last_price"]
             spread = p_fut - precio_dispo
-            d_fut  = _exp_to_date(fut["expiration"])
+            d_fut  = _exp_to_date_agro(fut["expiration"])
             days   = (d_fut - today).days
             tna    = None
             if days > 0 and precio_dispo > 0:
@@ -482,52 +512,75 @@ def _render_pases(pases: list[dict], cols_per_row: int = 3) -> None:
                     st.markdown(_render_pase_card(p), unsafe_allow_html=True)
 
 
-# ── render de pases agropecuarios (nuevo layout) ─────────────────────────────
+# ── render de pases agropecuarios ────────────────────────────────────────────
 
-def _render_pases_agro(
-    granos: list[dict],
-    precios_dispo: dict[str, float | None],
-    cols_per_row: int = 3,
-    max_fut_pases: int = 5,
-) -> None:
-    """Layout por familia:
-    - Columna izquierda : Disponible → cada futuro (precio viene de session_state)
-    - Columna derecha   : Futuros entre sí, top N por volumen combinado
-    """
-    pases_fut   = build_pases(granos, consecutive_only=False)
-    pases_dispo = _build_pases_disponible(granos, precios_dispo)
+def _render_pases_dispo(granos: list[dict], cols_per_row: int = 3) -> None:
+    """Pestaña: Disponible → Futuro por familia."""
+    familias_con_datos: list[str] = []
+    for fam in FAMILIA_ORDEN:
+        precio = st.session_state.get(f"dispo_{fam}", 0.0) or 0.0
+        items = _build_pases_disponible(granos, {fam: precio}) if precio > 0 else []
+        if items:
+            familias_con_datos.append(fam)
+
+    total = sum(
+        len(_build_pases_disponible(granos, {fam: st.session_state.get(f"dispo_{fam}", 0.0) or 0.0}))
+        for fam in FAMILIA_ORDEN
+        if (st.session_state.get(f"dispo_{fam}", 0.0) or 0.0) > 0
+    )
+
+    st.markdown(
+        f'<div class="section-title">📦 Disponible → Futuro '
+        f'<span class="badge">{total}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    if not familias_con_datos:
+        st.markdown(
+            '<div class="empty-card">Ingresá precios disponibles en el panel de arriba.</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    for fam in FAMILIA_ORDEN:
+        precio = st.session_state.get(f"dispo_{fam}", 0.0) or 0.0
+        if not precio:
+            continue
+        items = _build_pases_disponible(granos, {fam: precio})
+        if not items:
+            continue
+        fam_name = GRAIN_NAMES.get(fam, fam)
+        st.markdown(f"### {fam_name}")
+        for p in items:
+            st.markdown(_render_pase_card(p), unsafe_allow_html=True)
+
+
+def _render_pases_fut_fut(granos: list[dict], cols_per_row: int = 3, max_fut_pases: int = 5) -> None:
+    """Pestaña: Futuro → Futuro por familia, top N por volumen."""
+    pases_fut = build_pases(granos, consecutive_only=False, agro_dates=True)
 
     by_family_fut: dict[str, list[dict]] = defaultdict(list)
     for p in pases_fut:
         by_family_fut[p["family"]].append(p)
 
-    by_family_dispo: dict[str, list[dict]] = defaultdict(list)
-    for p in pases_dispo:
-        by_family_dispo[p["family"]].append(p)
-
-    # Familias presentes en el orden definido
     familias_presentes: list[str] = []
     for fam in FAMILIA_ORDEN:
-        if fam in by_family_fut or fam in by_family_dispo:
+        if fam in by_family_fut:
             familias_presentes.append(fam)
-    for fam in set(list(by_family_fut) + list(by_family_dispo)):
+    for fam in by_family_fut:
         if fam not in familias_presentes:
             familias_presentes.append(fam)
 
-    total = (
-        sum(len(v) for v in by_family_fut.values())
-        + sum(len(v) for v in by_family_dispo.values())
-    )
+    total = sum(min(len(v), max_fut_pases) for v in by_family_fut.values())
     st.markdown(
-        f'<div class="section-title">🔁 Pases agropecuarios '
+        f'<div class="section-title">🔁 Futuros entre sí '
         f'<span class="badge">{total}</span></div>',
         unsafe_allow_html=True,
     )
 
     if not familias_presentes:
         st.markdown(
-            '<div class="empty-card">No hay suficientes contratos con precio '
-            "para armar pases todavía.</div>",
+            '<div class="empty-card">No hay suficientes contratos con precio para armar pases.</div>',
             unsafe_allow_html=True,
         )
         return
@@ -536,57 +589,22 @@ def _render_pases_agro(
         fam_name  = GRAIN_NAMES.get(fam, fam)
         fut_items = by_family_fut.get(fam, [])
 
-        # Ordenar por volumen combinado (short + long) descendente, luego tomar top N
+        rows_by_sym = {r.get("symbol", ""): r for r in granos}
         def _vol_key(p):
-            rows_by_sym = {r.get("symbol", ""): r for r in granos}
             v_s = (rows_by_sym.get(p["short_symbol"]) or {}).get("trade_volume") or 0
             v_l = (rows_by_sym.get(p["long_symbol"])  or {}).get("trade_volume") or 0
             return v_s + v_l
 
         fut_items.sort(key=_vol_key, reverse=True)
         fut_items = fut_items[:max_fut_pases]
-        # Re-ordenar los seleccionados por vencimiento para mostrarlos en orden
         fut_items.sort(key=lambda p: (p.get("short_exp", (0, 0)), p.get("long_exp", (0, 0))))
 
-        # Precio disponible desde session_state (lo carga el widget de fuera del fragment)
-        precio_dispo_fam = st.session_state.get(f"dispo_{fam}", 0.0) or 0.0
-        dispo_items = (
-            _build_pases_disponible(granos, {fam: precio_dispo_fam})
-            if precio_dispo_fam > 0
-            else []
-        )
-
-        st.markdown(f"### {fam_name}")
-
-        has_dispo = bool(dispo_items)
-        has_fut   = bool(fut_items)
-
-        if has_dispo and has_fut:
-            col_dispo, col_fut = st.columns(2)
-        elif has_dispo:
-            col_dispo = st.container()
-            col_fut   = None
-        elif has_fut:
-            col_dispo = None
-            col_fut   = st.container()
-        else:
-            st.markdown(
-                '<div class="empty-card">Sin contratos con precio para esta familia.</div>',
-                unsafe_allow_html=True,
-            )
+        if not fut_items:
             continue
 
-        if has_dispo and col_dispo is not None:
-            with col_dispo:
-                st.markdown("**Disponible → Futuro**")
-                for p in dispo_items:
-                    st.markdown(_render_pase_card(p), unsafe_allow_html=True)
-
-        if has_fut and col_fut is not None:
-            with col_fut:
-                st.markdown("**Entre futuros**")
-                for p in fut_items:
-                    st.markdown(_render_pase_card(p), unsafe_allow_html=True)
+        st.markdown(f"### {fam_name}")
+        for p in fut_items:
+            st.markdown(_render_pase_card(p), unsafe_allow_html=True)
 
 
 # ── helpers varios ───────────────────────────────────────────────────────────
@@ -673,9 +691,17 @@ def _render_dolares_financieros(
 
     spot = spot_pct = spot_prev = None
     if mayorista_data:
-        spot = mayorista_data.get("venta")
-        spot_pct = mayorista_data.get("variacion")
-        spot_prev = (spot / (1 + spot_pct / 100)) if (spot and spot_pct) else None
+        spot = mayorista_data.get("venta") or mayorista_data.get("compra")
+    elif dlr_spot_row:
+        spot = (dlr_spot_row.get("last_price") or dlr_spot_row.get("offer") or
+                dlr_spot_row.get("bid") or dlr_spot_row.get("prev_close") or
+                dlr_spot_row.get("closing_price"))
+        spot_prev = dlr_spot_row.get("prev_close") or dlr_spot_row.get("closing_price")
+        if spot and spot_prev:
+            try:
+                spot_pct = (spot - spot_prev) / spot_prev * 100
+            except Exception:
+                pass
 
     brecha_mep_spot = ((mep / spot - 1) * 100) if (mep and spot and spot > 0) else None
 
@@ -725,7 +751,7 @@ def _render_dolares_financieros(
         st.markdown(_fin_card("Dólar MEP", mep, mep_pct, mep_prev, sub_mep), unsafe_allow_html=True)
 
     with col_spot:
-        sub_spot = "dolarapi.com · mayorista" if spot else "mayorista · sin datos"
+        sub_spot = "DLR/SPOT · pyRofex" if spot else "DLR/SPOT · sin datos"
         st.markdown(_fin_card("Dólar A3500", spot, spot_pct, spot_prev, sub_spot), unsafe_allow_html=True)
 
     with col_ccl:
@@ -1247,15 +1273,7 @@ def main() -> None:
         rows.sort(key=lambda r: sort_key(r.get("symbol", ""), r.get("category", "")))
 
         monedas = [r for r in rows if r.get("category") == "DOLAR"]
-        granos  = [
-            r for r in rows
-            if r.get("category") == "GRANO"
-            and (r.get("trade_volume") or 0) > 0
-            and "MINI" not in r.get("symbol", "").upper()
-            and "DISPO" not in r.get("symbol", "").upper()
-            and ".ROS/" in r.get("symbol", "").upper()
-            and r.get("symbol", "").count("/") == 1
-        ]
+        granos  = [r for r in rows if r.get("category") == "GRANO"]
 
         monedas_puros = [
             r for r in monedas
@@ -1273,18 +1291,17 @@ def main() -> None:
 
         mep_rows      = mgr.get_external("MEP")
         ccl_rows      = mgr.get_external("CCL")
-        try:
-            import requests as _req
-            _r = _req.get("https://dolarapi.com/v1/dolares/mayorista", timeout=5)
-            mayorista_data = _r.json() if _r.status_code == 200 else None
-        except Exception:
-            mayorista_data = None
+        mayorista_raw = mgr.get_external("MAYORISTA")
+        mayorista_data = (
+            mayorista_raw if isinstance(mayorista_raw, dict)
+            else (mayorista_raw[0] if mayorista_raw else None)
+        )
         acciones = mgr.get_external("ACCIONES")
         bonos    = mgr.get_external("BONOS")
         cedears  = mgr.get_external("CEDEARS")
 
         pases_monedas = build_pases(monedas_puros, consecutive_only=True)
-        pases_granos  = build_pases(granos, consecutive_only=False)
+        pases_granos  = build_pases(granos, consecutive_only=False, agro_dates=True)
 
         with placeholder.container():
             now_ba = datetime.now(BA_TZ).strftime("%H:%M:%S")
@@ -1297,13 +1314,14 @@ def main() -> None:
             st.divider()
 
             (
-                tab_monedas, tab_pmon, tab_granos, tab_pgran,
+                tab_monedas, tab_pmon, tab_granos, tab_pdispo, tab_pfut,
                 tab_acc, tab_bon, tab_ced, tab_heat, tab_tabla,
             ) = st.tabs([
                 f"💵 Monedas ({len(monedas_puros)})",
                 f"🔁 Pases monedas ({len(pases_monedas)})",
                 f"🌾 Granos ({len(granos)})",
-                f"🔁 Pases agropecuarios ({len(pases_granos)})",
+                "📦 Pases disponible",
+                f"🔁 Pases futuros ({len(pases_granos)})",
                 f"🏢 Acciones ({len(acciones)})",
                 f"🏛️ Bonos ({len(bonos)})",
                 f"🍎 CEDEARs ({len(cedears)})",
@@ -1320,11 +1338,11 @@ def main() -> None:
             with tab_granos:
                 _render_group("Granos", "🌾", granos, cols_per_row=cols_per_row)
 
-            with tab_pgran:
-                # Los precios del sidebar son el valor inicial;
-                # el input inline dentro de _render_pases_agro permite editarlos por familia
-                # precios_dispo no se pasan: _render_pases_agro los lee de session_state
-                _render_pases_agro(granos, {}, cols_per_row=cols_per_row)
+            with tab_pdispo:
+                _render_pases_dispo(granos, cols_per_row=cols_per_row)
+
+            with tab_pfut:
+                _render_pases_fut_fut(granos, cols_per_row=cols_per_row)
 
             with tab_acc:
                 _render_byma_panel("Acciones BYMA", "🏢", acciones,
